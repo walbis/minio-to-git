@@ -1,0 +1,62 @@
+# Minio to GitOps Configuration
+# Update these values according to your setup
+
+minio:
+  endpoint: "localhost:9000"  # Your Minio server endpoint
+  access_key: "minioadmin"    # Minio access key
+  secret_key: "minioadmin123" # Minio secret key
+  secure: false               # Use HTTPS (true) or HTTP (false)
+  bucket: "openshift-cluster-backups-4"  # Source bucket name
+  prefix: "crc.testing/crc-wrl62"        # Optional: prefix path in bucket
+
+git:
+  repository: "https://github.com/walbis/test.git"  # Target Git repository
+
+# Cluster mappings for different environments
+clusters:
+  # Default mapping applied to all namespaces
+  default:
+    dev: "https://dev-cluster-api.example.com"
+    test: "https://test-cluster-api.example.com" 
+    preprod: "https://preprod-cluster-api.example.com"
+    prod: "https://prod-cluster-api.example.com"
+  
+  # Namespace-specific overrides (optional)
+  # Uncomment and modify as needed
+  # berkay-test:
+  #   dev: "https://special-dev-cluster.example.com"
+  #   test: "https://special-test-cluster.example.com"
+  #   preprod: "https://special-preprod-cluster.example.com"
+  #   prod: "https://special-prod-cluster.example.com"
+  #
+  # cluster-backup:
+  #   dev: "https://backup-dev-cluster.example.com"
+  #   test: "https://backup-test-cluster.example.com"
+  #   preprod: "https://backup-preprod-cluster.example.com"
+  #   prod: "https://backup-prod-cluster.example.com"
+
+# Environment-specific settings
+environments:
+  dev:
+    sync_policy: "automated"  # automated or manual
+    replicas: 1
+    storage_size_small: "2Gi"
+    storage_size_large: "5Gi"
+    
+  test:
+    sync_policy: "automated"
+    replicas: 1  
+    storage_size_small: "1Gi"
+    storage_size_large: "2Gi"
+    
+  preprod:
+    sync_policy: "manual"
+    replicas: 2
+    storage_size_small: "10Gi"
+    storage_size_large: "20Gi"
+    
+  prod:
+    sync_policy: "manual"
+    replicas: 3
+    storage_size_small: "50Gi" 
+    storage_size_large: "100Gi"
