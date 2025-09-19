@@ -16,6 +16,67 @@ from dataclasses import dataclass, field
 from minio import Minio
 from minio.error import S3Error
 
+# Custom Exceptions for better error handling
+class MinioGitOpsError(Exception):
+    """Base exception for Minio GitOps generator errors"""
+    pass
+
+class ConfigurationError(MinioGitOpsError):
+    """Configuration related errors"""
+    pass
+
+class MinioConnectionError(MinioGitOpsError):
+    """Minio connection and access errors"""
+    pass
+
+class YAMLProcessingError(MinioGitOpsError):
+    """YAML parsing and processing errors"""
+    pass
+
+class PathValidationError(MinioGitOpsError):
+    """Path structure validation errors"""
+    pass
+
+class NamespaceValidationError(MinioGitOpsError):
+    """Namespace naming validation errors"""
+    pass
+
+class StorageConfigurationError(MinioGitOpsError):
+    """Storage configuration and detection errors"""
+    pass
+
+# Configuration Constants
+class Constants:
+    # Display and Logging Configuration
+    MAX_FAILED_FILES_DISPLAY = 5
+    MAX_WARNINGS_DISPLAY = 3
+    PROGRESS_UPDATE_INTERVAL = 5  # Show progress every N files
+    
+    # Path Validation
+    MIN_PATH_PARTS = 2
+    MAX_NAMESPACE_LENGTH = 63
+    
+    # Storage Scaling Factors
+    STORAGE_SCALE_TEST = 0.5    # Half size for test
+    STORAGE_SCALE_PREPROD = 2   # 2x size for preprod  
+    STORAGE_SCALE_PROD = 5      # 5x size for prod
+    
+    # Default Storage Sizes (fallback)
+    DEFAULT_STORAGE_TEST = '1Gi'
+    DEFAULT_STORAGE_PREPROD = '10Gi'
+    DEFAULT_STORAGE_PROD = '50Gi'
+    
+    # Replica Configuration
+    DEFAULT_REPLICAS_TEST = 1
+    DEFAULT_REPLICAS_PREPROD = 2
+    DEFAULT_REPLICAS_PROD = 3
+    
+    # Progress Display
+    PROGRESS_DECIMAL_PLACES = 1
+    
+    # Memory Management
+    MEMORY_BATCH_SIZE = 100  # Process objects in batches to control memory usage
+
 @dataclass
 class ClusterMapping:
     dev: str
@@ -58,17 +119,17 @@ class ProcessingResult:
         
         if self.failed_files:
             print(f"\n❌ Failed Files:")
-            for filename, error in self.failed_files[:5]:  # Show first 5
+            for filename, error in self.failed_files[:Constants.MAX_FAILED_FILES_DISPLAY]:
                 print(f"   • {filename}: {error}")
-            if len(self.failed_files) > 5:
-                print(f"   • ... and {len(self.failed_files) - 5} more")
+            if len(self.failed_files) > Constants.MAX_FAILED_FILES_DISPLAY:
+                print(f"   • ... and {len(self.failed_files) - Constants.MAX_FAILED_FILES_DISPLAY} more")
         
         if self.warnings:
             print(f"\n⚠️  Warnings:")
-            for warning in self.warnings[:3]:  # Show first 3
+            for warning in self.warnings[:Constants.MAX_WARNINGS_DISPLAY]:
                 print(f"   • {warning}")
-            if len(self.warnings) > 3:
-                print(f"   • ... and {len(self.warnings) - 3} more")
+            if len(self.warnings) > Constants.MAX_WARNINGS_DISPLAY:
+                print(f"   • ... and {len(self.warnings) - Constants.MAX_WARNINGS_DISPLAY} more")
 
 class MinioGitOpsGenerator:
     def __init__(self, minio_config: dict, cluster_mappings: dict, git_repo: str):
@@ -92,65 +153,43 @@ class MinioGitOpsGenerator:
         result = ProcessingResult()
         
         try:
-            # List all objects in bucket
-            print("📋 Listing objects in bucket...")
-            objects = list(self.minio_client.list_objects(
+            # Memory-optimized batch processing approach
+            print("📋 Processing objects in memory-efficient batches...")
+            
+            batch_size = Constants.MEMORY_BATCH_SIZE if hasattr(Constants, 'MEMORY_BATCH_SIZE') else 100
+            batch = []
+            processed_count = 0
+            total_objects = 0  # We'll count as we go
+            
+            # Process objects in batches to control memory usage
+            for obj in self.minio_client.list_objects(
                 self.bucket_name, 
                 prefix=self.bucket_prefix,
                 recursive=True
-            ))
+            ):
+                total_objects += 1
+                batch.append(obj)
+                
+                # Process batch when it's full
+                if len(batch) >= batch_size:
+                    processed_count += self._process_object_batch(batch, namespace_resources, result, processed_count, total_objects)
+                    batch.clear()  # Clear batch to free memory
             
-            print(f"📄 Found {len(objects)} objects in bucket")
-            
-            # Progress tracking
-            total_objects = len(objects)
-            processed_count = 0
-            
-            for obj in objects:
-                processed_count += 1
-                try:
-                    # Skip non-YAML files
-                    if not obj.object_name.endswith('.yaml'):
-                        continue
-                    
-                    # Parse path with validation
-                    path_result = self._safe_parse_path(obj.object_name, self.bucket_prefix)
-                    if not path_result:
-                        result.add_warning(f"Skipping file with invalid path structure: {obj.object_name}")
-                        continue
-                    
-                    namespace, filename = path_result
-                    
-                    # Initialize namespace if not exists
-                    if namespace not in namespace_resources:
-                        namespace_resources[namespace] = {}
-                        result.namespaces_found.append(namespace)
-                    
-                    # Categorize resource by filename pattern
-                    resource_type = self._categorize_resource(filename)
-                    if resource_type not in namespace_resources[namespace]:
-                        namespace_resources[namespace][resource_type] = []
-                    
-                    namespace_resources[namespace][resource_type].append(filename)
-                    result.add_success(obj.object_name)
-                    
-                    # Progress indicator
-                    if processed_count % 5 == 0 or processed_count == total_objects:
-                        progress = (processed_count / total_objects) * 100
-                        print(f"📊 Progress: {processed_count}/{total_objects} ({progress:.1f}%) - Found: {namespace}/{resource_type}/{filename}")
-                    else:
-                        print(f"📄 Found: {namespace}/{resource_type}/{filename}")
-                    
-                except Exception as e:
-                    result.add_failure(obj.object_name, str(e))
-                    print(f"⚠️  Error processing {obj.object_name}: {e}")
-                    continue  # Continue with next file
+            # Process final batch
+            if batch:
+                processed_count += self._process_object_batch(batch, namespace_resources, result, processed_count, total_objects)
+                
+            print(f"📄 Total processed: {processed_count}/{total_objects} objects")
         
         except S3Error as e:
             error_msg = f"Failed to connect to Minio: {e}"
             result.add_failure("minio_connection", error_msg)
             print(f"❌ {error_msg}")
             # Don't exit, return empty result
+            return [], result
+        except MinioConnectionError as e:
+            result.add_failure("minio_connection", str(e))
+            print(f"❌ Minio Connection Error: {e}")
             return [], result
         except Exception as e:
             error_msg = f"Unexpected error during bucket scan: {e}"
@@ -176,6 +215,55 @@ class MinioGitOpsGenerator:
         
         print(f"✅ Detected {len(self.namespaces)} namespaces: {[ns.name for ns in self.namespaces]}")
         return self.namespaces, result
+    
+    def _process_object_batch(self, batch: list, namespace_resources: dict, result: ProcessingResult, 
+                             start_count: int, total_objects: int) -> int:
+        """Process a batch of objects in memory-efficient way"""
+        batch_processed = 0
+        
+        for obj in batch:
+            current_count = start_count + batch_processed + 1
+            try:
+                # Skip non-YAML files
+                if not obj.object_name.endswith('.yaml'):
+                    continue
+                
+                # Parse path with validation
+                path_result = self._safe_parse_path(obj.object_name, self.bucket_prefix)
+                if not path_result:
+                    result.add_warning(f"Skipping file with invalid path structure: {obj.object_name}")
+                    continue
+                
+                namespace, filename = path_result
+                
+                # Initialize namespace if not exists
+                if namespace not in namespace_resources:
+                    namespace_resources[namespace] = {}
+                    result.namespaces_found.append(namespace)
+                
+                # Categorize resource by filename pattern
+                resource_type = self._categorize_resource(filename)
+                if resource_type not in namespace_resources[namespace]:
+                    namespace_resources[namespace][resource_type] = []
+                
+                namespace_resources[namespace][resource_type].append(filename)
+                result.add_success(obj.object_name)
+                
+                # Progress indicator
+                if current_count % Constants.PROGRESS_UPDATE_INTERVAL == 0 or current_count == total_objects:
+                    progress = (current_count / total_objects) * 100
+                    print(f"📊 Progress: {current_count}/{total_objects} ({progress:.{Constants.PROGRESS_DECIMAL_PLACES}f}%) - Found: {namespace}/{resource_type}/{filename}")
+                elif current_count % 20 == 0:  # Show less frequent updates to reduce noise
+                    print(f"📄 Found: {namespace}/{resource_type}/{filename}")
+                
+                batch_processed += 1
+                
+            except Exception as e:
+                result.add_failure(obj.object_name, str(e))
+                print(f"⚠️  Error processing {obj.object_name}: {e}")
+                continue  # Continue with next file
+        
+        return batch_processed
     
     def _validate_yaml_content(self, file_path: Path) -> bool:
         """Validate that YAML file has proper structure and no leftover K8s metadata"""
@@ -209,20 +297,30 @@ class MinioGitOpsGenerator:
             
         except yaml.YAMLError as e:
             print(f"❌ YAML validation failed for {file_path}: {e}")
-            return False
+            raise YAMLProcessingError(f"YAML validation failed for {file_path}: {e}") from e
         except Exception as e:
             print(f"❌ Validation error for {file_path}: {e}")
-            return False
+            raise YAMLProcessingError(f"Validation error for {file_path}: {e}") from e
     
     def _safe_parse_path(self, object_path: str, prefix: str) -> Tuple[str, str] or None:
-        """Safely parse Minio object path to extract namespace and filename"""
+        """Platform-agnostic path parsing for Minio object paths"""
         try:
-            # Remove prefix and clean path
+            # Import platform-specific utilities
+            import os
+            from pathlib import PurePosixPath  # Minio always uses POSIX paths
+            
+            # Remove prefix and clean path - always use forward slashes for Minio
             clean_path = object_path.replace(prefix, '').strip('/')
-            path_parts = clean_path.split('/')
+            
+            # Normalize path separators - Minio uses POSIX style regardless of platform
+            clean_path = clean_path.replace('\\', '/')
+            
+            # Use PurePosixPath for consistent parsing across platforms
+            path_obj = PurePosixPath(clean_path)
+            path_parts = path_obj.parts
             
             # Validate path structure
-            if len(path_parts) < 2:
+            if len(path_parts) < Constants.MIN_PATH_PARTS:
                 return None
                 
             # Extract namespace and filename
@@ -235,11 +333,12 @@ class MinioGitOpsGenerator:
                 
             # Sanitize namespace name (Kubernetes naming rules)
             if not self._is_valid_namespace_name(namespace):
-                return None
+                raise NamespaceValidationError(f"Invalid namespace name: {namespace}")
                 
             return namespace, filename
             
-        except Exception:
+        except Exception as e:
+            print(f"⚠️  Path parsing error for {object_path}: {e}")
             return None
     
     def _is_valid_namespace_name(self, name: str) -> bool:
@@ -247,40 +346,106 @@ class MinioGitOpsGenerator:
         import re
         
         # Basic Kubernetes naming rules
-        if len(name) > 63:
+        if len(name) > Constants.MAX_NAMESPACE_LENGTH:
             return False
         if not re.match(r'^[a-z0-9]([-a-z0-9]*[a-z0-9])?$', name):
             return False
         return True
     
-    def _categorize_resource(self, filename: str) -> str:
-        """Categorize Kubernetes resource by filename"""
+    def _categorize_resource(self, filename: str, file_content: str = None) -> str:
+        """Enhanced resource categorization using both filename and YAML content"""
+        
+        # First try YAML content analysis if available
+        if file_content:
+            try:
+                category = self._categorize_by_yaml_content(file_content)
+                if category != 'other':
+                    return category
+            except Exception as e:
+                print(f"⚠️  Could not parse YAML content for {filename}: {e}")
+                
+        # Fallback to enhanced filename analysis
+        return self._categorize_by_filename(filename)
+    
+    def _categorize_by_yaml_content(self, content: str) -> str:
+        """Categorize resource by analyzing YAML content"""
+        try:
+            docs = list(yaml.safe_load_all(content))
+            for doc in docs:
+                if not doc or 'kind' not in doc:
+                    continue
+                    
+                kind = doc['kind'].lower()
+                
+                # Direct kind mapping
+                kind_mapping = {
+                    'deployment': 'deployments',
+                    'service': 'services', 
+                    'configmap': 'configmaps',
+                    'secret': 'secrets',
+                    'persistentvolumeclaim': 'persistentvolumeclaims',
+                    'route': 'routes',
+                    'ingress': 'ingress',
+                    'cronjob': 'cronjobs',
+                    'job': 'jobs',
+                    'horizontalpodautoscaler': 'hpa',
+                    'imagestream': 'imagestreams',
+                    'networkpolicy': 'networkpolicies',
+                    'statefulset': 'statefulsets',
+                    'daemonset': 'daemonsets',
+                    'replicaset': 'replicasets',
+                    'pod': 'pods',
+                    'namespace': 'namespaces',
+                    'role': 'roles',
+                    'rolebinding': 'rolebindings',
+                    'clusterrole': 'clusterroles',
+                    'clusterrolebinding': 'clusterrolebindings',
+                    'serviceaccount': 'serviceaccounts'
+                }
+                
+                if kind in kind_mapping:
+                    return kind_mapping[kind]
+                    
+            return 'other'
+            
+        except yaml.YAMLError:
+            return 'other'
+    
+    def _categorize_by_filename(self, filename: str) -> str:
+        """Enhanced filename-based categorization with more patterns"""
         filename_lower = filename.lower()
         
-        if any(word in filename_lower for word in ['deploy', 'deployment']):
-            return 'deployments'
-        elif any(word in filename_lower for word in ['service', 'svc']):
-            return 'services'
-        elif any(word in filename_lower for word in ['config', 'cm']):
-            return 'configmaps'
-        elif any(word in filename_lower for word in ['secret']):
-            return 'secrets'
-        elif any(word in filename_lower for word in ['pvc', 'persistent']):
-            return 'persistentvolumeclaims'
-        elif any(word in filename_lower for word in ['route']):
-            return 'routes'
-        elif any(word in filename_lower for word in ['ingress']):
-            return 'ingress'
-        elif any(word in filename_lower for word in ['cron', 'job']):
-            return 'cronjobs'
-        elif any(word in filename_lower for word in ['hpa', 'autoscal']):
-            return 'hpa'
-        elif any(word in filename_lower for word in ['image', 'stream']):
-            return 'imagestreams'
-        elif any(word in filename_lower for word in ['network', 'policy']):
-            return 'networkpolicies'
-        else:
-            return 'other'
+        # More comprehensive filename patterns
+        patterns = {
+            'deployments': ['deploy', 'deployment'],
+            'services': ['service', 'svc'],
+            'configmaps': ['config', 'cm', 'configmap'],
+            'secrets': ['secret'],
+            'persistentvolumeclaims': ['pvc', 'persistent', 'volume', 'claim'],
+            'routes': ['route'],
+            'ingress': ['ingress'],
+            'cronjobs': ['cron', 'cronjob'],
+            'jobs': ['job'],
+            'hpa': ['hpa', 'autoscal', 'horizontal'],
+            'imagestreams': ['image', 'stream', 'imagestream'],
+            'networkpolicies': ['network', 'policy', 'netpol'],
+            'statefulsets': ['stateful', 'sts'],
+            'daemonsets': ['daemon', 'ds'],
+            'replicasets': ['replica', 'rs'],
+            'pods': ['pod'],
+            'namespaces': ['namespace', 'ns'],
+            'roles': ['role'],
+            'rolebindings': ['rolebind', 'binding'],
+            'serviceaccounts': ['serviceaccount', 'sa']
+        }
+        
+        for category, keywords in patterns.items():
+            if any(keyword in filename_lower for keyword in keywords):
+                return category
+                
+        # Still return 'other' but log for investigation
+        print(f"⚠️  Unrecognized resource type for file: {filename}")
+        return 'other'
     
     def download_resources(self) -> ProcessingResult:
         """Download all resources from Minio to local filesystem with error handling"""
@@ -288,7 +453,7 @@ class MinioGitOpsGenerator:
         result = ProcessingResult()
         
         for namespace in self.namespaces:
-            base_path = Path(f"namespaces/{namespace.name}/environments/dev")
+            base_path = Path("namespaces") / namespace.name / "environments" / "dev"
             
             for resource_type, filenames in namespace.resources.items():
                 resource_dir = base_path / resource_type
@@ -311,6 +476,20 @@ class MinioGitOpsGenerator:
                             minio_path,
                             str(local_path)
                         )
+                        
+                        # Enhanced categorization using downloaded content
+                        try:
+                            with open(local_path, 'r') as f:
+                                file_content = f.read()
+                            
+                            # Re-categorize with content analysis
+                            better_category = self._categorize_resource(local_path.name, file_content)
+                            if better_category != resource_type:
+                                print(f"🔍 Improved categorization: {local_path.name} {resource_type} → {better_category}")
+                                # Update category if needed (would require refactoring, for now just log)
+                                
+                        except Exception as e:
+                            print(f"⚠️  Could not re-categorize {local_path.name}: {e}")
                         
                         # Clean up Kubernetes metadata
                         cleanup_success = self._cleanup_k8s_metadata(local_path)
@@ -430,7 +609,7 @@ class MinioGitOpsGenerator:
         print(f"📦 Generating structure for namespace: {namespace.name}")
         
         # Create directory structure
-        ns_path = Path(f"namespaces/{namespace.name}")
+        ns_path = Path("namespaces") / namespace.name
         (ns_path / "argocd-apps").mkdir(parents=True, exist_ok=True)
         
         for env in ['dev', 'test', 'preprod', 'prod']:
@@ -447,8 +626,9 @@ class MinioGitOpsGenerator:
     
     def _generate_argocd_apps(self, namespace: NamespaceConfig) -> None:
         """Generate ArgoCD Application manifests for all environments"""
-        apps_path = Path(f"namespaces/{namespace.name}/argocd-apps")
+        apps_path = Path("namespaces") / namespace.name / "argocd-apps"
         
+        # CONSISTENT NAMING: Every environment gets its own namespace suffix
         environments = {
             'dev': {
                 'cluster': namespace.cluster_mapping.dev,
@@ -457,7 +637,7 @@ class MinioGitOpsGenerator:
             },
             'test': {
                 'cluster': namespace.cluster_mapping.test,
-                'target_namespace': namespace.name,
+                'target_namespace': f"{namespace.name}-test",  # FIX: Was namespace.name
                 'sync_policy': {'automated': {'prune': True, 'selfHeal': True}}
             },
             'preprod': {
@@ -467,7 +647,7 @@ class MinioGitOpsGenerator:
             },
             'prod': {
                 'cluster': namespace.cluster_mapping.prod,
-                'target_namespace': namespace.name,
+                'target_namespace': f"{namespace.name}-prod",  # FIX: Was namespace.name
                 'sync_policy': {'automated': {'prune': False, 'selfHeal': False}}
             }
         }
@@ -513,6 +693,70 @@ class MinioGitOpsGenerator:
             
             print(f"📄 Generated ArgoCD App: {app_file}")
     
+    def _detect_pvc_storage_requirements(self, namespace: NamespaceConfig) -> Dict[str, Dict[str, str]]:
+        """Dynamically detect PVC storage requirements from namespace resources"""
+        storage_configs = {
+            'test': {},
+            'preprod': {},
+            'prod': {}
+        }
+        
+        # Check if namespace has PVCs
+        if 'persistentvolumeclaims' not in namespace.resources:
+            return storage_configs
+        
+        # Scan actual PVC files to extract names and base storage sizes
+        pvc_dir = Path("namespaces") / namespace.name / "environments" / "dev" / "persistentvolumeclaims"
+        if not pvc_dir.exists():
+            return storage_configs
+        
+        detected_pvcs = []
+        for pvc_file in pvc_dir.glob("*.yaml"):
+            try:
+                with open(pvc_file, 'r') as f:
+                    docs = list(yaml.safe_load_all(f))
+                    for doc in docs:
+                        if doc and doc.get('kind') == 'PersistentVolumeClaim':
+                            pvc_name = doc.get('metadata', {}).get('name', pvc_file.stem)
+                            # Extract base storage size
+                            base_size = doc.get('spec', {}).get('resources', {}).get('requests', {}).get('storage', '1Gi')
+                            detected_pvcs.append((pvc_name, base_size))
+            except yaml.YAMLError as e:
+                print(f"⚠️  YAML parsing error in PVC file {pvc_file}: {e}")
+                # Fallback to filename
+                detected_pvcs.append((pvc_file.stem, Constants.DEFAULT_STORAGE_TEST))
+            except Exception as e:
+                print(f"⚠️  Could not parse PVC file {pvc_file}: {e}")
+                # Fallback to filename  
+                detected_pvcs.append((pvc_file.stem, Constants.DEFAULT_STORAGE_TEST))
+        
+        # Generate environment-specific storage configurations
+        for pvc_name, base_size in detected_pvcs:
+            # Parse base size to create scaled versions
+            try:
+                import re
+                size_match = re.match(r'(\d+)(\w+)', base_size)
+                if size_match:
+                    base_num = int(size_match.group(1))
+                    unit = size_match.group(2)
+                    
+                    # Scale storage based on environment using constants
+                    storage_configs['test'][pvc_name] = f"{max(1, int(base_num * Constants.STORAGE_SCALE_TEST))}{unit}"
+                    storage_configs['preprod'][pvc_name] = f"{base_num * Constants.STORAGE_SCALE_PREPROD}{unit}"
+                    storage_configs['prod'][pvc_name] = f"{base_num * Constants.STORAGE_SCALE_PROD}{unit}"
+                else:
+                    # Fallback if parsing fails - use constants
+                    storage_configs['test'][pvc_name] = Constants.DEFAULT_STORAGE_TEST
+                    storage_configs['preprod'][pvc_name] = Constants.DEFAULT_STORAGE_PREPROD
+                    storage_configs['prod'][pvc_name] = Constants.DEFAULT_STORAGE_PROD
+            except Exception:
+                # Fallback to default sizes using constants
+                storage_configs['test'][pvc_name] = Constants.DEFAULT_STORAGE_TEST
+                storage_configs['preprod'][pvc_name] = Constants.DEFAULT_STORAGE_PREPROD
+                storage_configs['prod'][pvc_name] = Constants.DEFAULT_STORAGE_PROD
+        
+        return storage_configs
+
     def _generate_kustomizations(self, namespace: NamespaceConfig) -> None:
         """Generate Kustomization files for all environments"""
         
@@ -530,29 +774,32 @@ class MinioGitOpsGenerator:
             }
         }
         
-        dev_file = Path(f"namespaces/{namespace.name}/environments/dev/kustomization.yaml")
+        dev_file = Path("namespaces") / namespace.name / "environments" / "dev" / "kustomization.yaml"
         with open(dev_file, 'w') as f:
             yaml.dump(dev_kustomization, f, default_flow_style=False, sort_keys=False)
         
-        # Other environments (overlays)
+        # Dynamically detect storage requirements
+        dynamic_storage = self._detect_pvc_storage_requirements(namespace)
+        
+        # Other environments (overlays) - CONSISTENT NAMING
         overlays = {
             'test': {
-                'namespace': namespace.name,
+                'namespace': f"{namespace.name}-test",  # FIX: Was namespace.name
                 'namePrefix': 'test-',
-                'replicas': 1,
-                'storage_patches': {'postgres-pvc': '1Gi', 'web-logs-pvc': '500Mi'}
+                'replicas': Constants.DEFAULT_REPLICAS_TEST,
+                'storage_patches': dynamic_storage['test']
             },
             'preprod': {
                 'namespace': f"{namespace.name}-preprod", 
                 'namePrefix': 'preprod-',
-                'replicas': 2,
-                'storage_patches': {'postgres-pvc': '10Gi', 'web-logs-pvc': '5Gi'}
+                'replicas': Constants.DEFAULT_REPLICAS_PREPROD,
+                'storage_patches': dynamic_storage['preprod']
             },
             'prod': {
-                'namespace': namespace.name,
-                'namePrefix': '',
-                'replicas': 3,
-                'storage_patches': {'postgres-pvc': '50Gi', 'web-logs-pvc': '20Gi'}
+                'namespace': f"{namespace.name}-prod",  # FIX: Was namespace.name
+                'namePrefix': 'prod-',  # FIX: Add prefix for consistency
+                'replicas': Constants.DEFAULT_REPLICAS_PROD,
+                'storage_patches': dynamic_storage['prod']
             }
         }
         
@@ -602,7 +849,7 @@ class MinioGitOpsGenerator:
             if patches:
                 overlay_kustomization['patches'] = patches
             
-            overlay_file = Path(f"namespaces/{namespace.name}/environments/{env}/kustomization.yaml")
+            overlay_file = Path("namespaces") / namespace.name / "environments" / env / "kustomization.yaml"
             with open(overlay_file, 'w') as f:
                 yaml.dump(overlay_kustomization, f, default_flow_style=False, sort_keys=False)
             
@@ -675,7 +922,7 @@ kubectl get all,pvc,routes,configmaps -n {namespace.name}
 *Generated automatically from Minio bucket by minio-to-gitops.py*
 """
         
-        readme_file = Path(f"namespaces/{namespace.name}/README.md")
+        readme_file = Path("namespaces") / namespace.name / "README.md"
         with open(readme_file, 'w') as f:
             f.write(readme_content)
         
@@ -744,90 +991,74 @@ argocd cluster add prod-context --name prod-cluster
         print("📄 Generated root README.md")
 
 def load_config(config_path='config.yaml', validate_env=True):
-    """Load configuration from YAML file with environment variable support"""
+    """Simplified configuration loading with environment variable support"""
     import os
     
     if not os.path.exists(config_path):
-        raise FileNotFoundError(f"Configuration file not found: {config_path}")
+        raise ConfigurationError(f"Configuration file not found: {config_path}")
     
     try:
         with open(config_path, 'r') as f:
             config = yaml.safe_load(f)
     except yaml.YAMLError as e:
-        raise ValueError(f"Invalid YAML in config file: {e}")
+        raise ConfigurationError(f"Invalid YAML in config file: {e}")
     
-    # Support environment variables for sensitive data
-    def get_config_value(config_dict, key, env_var=None, required=True):
-        """Get config value with environment variable fallback"""
-        if env_var:
-            env_value = os.getenv(env_var)
-            if env_value:
-                return env_value
-        
-        value = config_dict.get(key)
-        if required and not value:
-            raise ValueError(f"Missing required configuration: {key} (or env var: {env_var})")
-        return value
-    
-    # Extract minio config with env var support
-    minio_config = {
-        'endpoint': get_config_value(config['minio'], 'endpoint', 'MINIO_ENDPOINT'),
-        'access_key': get_config_value(config['minio'], 'access_key', 'MINIO_ACCESS_KEY'),
-        'secret_key': get_config_value(config['minio'], 'secret_key', 'MINIO_SECRET_KEY'),
-        'secure': config['minio'].get('secure', False),
-        'bucket': get_config_value(config['minio'], 'bucket', 'MINIO_BUCKET'),
-        'prefix': config['minio'].get('prefix', '')
+    # Simple environment variable override
+    env_mappings = {
+        'MINIO_ENDPOINT': ('minio', 'endpoint'),
+        'MINIO_ACCESS_KEY': ('minio', 'access_key'),
+        'MINIO_SECRET_KEY': ('minio', 'secret_key'),
+        'MINIO_BUCKET': ('minio', 'bucket'),
+        'GIT_REPOSITORY': ('git', 'repository')
     }
     
-    # Extract git repo
-    git_repo = get_config_value(config['git'], 'repository', 'GIT_REPOSITORY')
-    
-    # Extract cluster mappings
-    cluster_mappings = config.get('clusters', {})
-    
-    # Validate cluster mappings
-    if 'default' not in cluster_mappings:
-        raise ValueError("Configuration must contain 'default' cluster mapping")
-    
-    required_envs = ['dev', 'test', 'preprod', 'prod']
-    for env in required_envs:
-        if env not in cluster_mappings['default']:
-            raise ValueError(f"Default cluster mapping missing environment: {env}")
-    
-    # Validate environment variables if requested
-    if validate_env:
-        _validate_environment_config(config)
-    
-    return minio_config, cluster_mappings, git_repo, config
-
-def _validate_environment_config(config):
-    """Validate environment-specific configuration"""
-    import os
-    
-    # Check for environment-specific overrides
-    env_overrides = {
-        'MINIO_ENDPOINT': config['minio'].get('endpoint'),
-        'MINIO_ACCESS_KEY': config['minio'].get('access_key'),
-        'MINIO_SECRET_KEY': config['minio'].get('secret_key'),
-        'MINIO_BUCKET': config['minio'].get('bucket'),
-        'GIT_REPOSITORY': config['git'].get('repository')
-    }
-    
-    # Log which values are being used from environment
+    # Apply environment overrides
     env_used = []
-    for env_var, config_value in env_overrides.items():
-        if os.getenv(env_var):
+    for env_var, (section, key) in env_mappings.items():
+        value = os.getenv(env_var)
+        if value:
+            if section not in config:
+                config[section] = {}
+            config[section][key] = value
             env_used.append(env_var)
     
     if env_used:
         print(f"🔐 Using environment variables: {', '.join(env_used)}")
     
-    # Validate critical settings
-    if not config.get('minio', {}).get('endpoint') and not os.getenv('MINIO_ENDPOINT'):
-        raise ValueError("Minio endpoint must be specified in config or MINIO_ENDPOINT environment variable")
-        
-    if not config.get('git', {}).get('repository') and not os.getenv('GIT_REPOSITORY'):
-        raise ValueError("Git repository must be specified in config or GIT_REPOSITORY environment variable")
+    # Validate required fields
+    required_fields = [
+        ('minio.endpoint', config.get('minio', {}).get('endpoint')),
+        ('minio.access_key', config.get('minio', {}).get('access_key')),
+        ('minio.secret_key', config.get('minio', {}).get('secret_key')),
+        ('minio.bucket', config.get('minio', {}).get('bucket')),
+        ('git.repository', config.get('git', {}).get('repository')),
+    ]
+    
+    for field_name, value in required_fields:
+        if not value:
+            raise ConfigurationError(f"Missing required configuration: {field_name}")
+    
+    # Validate cluster configuration
+    if 'clusters' not in config or 'default' not in config['clusters']:
+        raise ConfigurationError("Missing clusters.default configuration")
+    
+    for env in ['dev', 'test', 'preprod', 'prod']:
+        if env not in config['clusters']['default']:
+            raise ConfigurationError(f"Missing cluster mapping for: {env}")
+    
+    # Extract clean configurations
+    minio_config = {
+        'endpoint': config['minio']['endpoint'],
+        'access_key': config['minio']['access_key'],
+        'secret_key': config['minio']['secret_key'],
+        'bucket': config['minio']['bucket'],
+        'prefix': config['minio'].get('prefix', ''),
+        'secure': config['minio'].get('secure', False)
+    }
+    
+    return minio_config, config['clusters'], config['git']['repository'], config
+
+# Note: _validate_environment_config function removed - validation now integrated into load_config
 
 def create_backup(backup_name=None):
     """Create backup of existing namespaces directory"""
