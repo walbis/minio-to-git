@@ -103,11 +103,6 @@ class Constants:
     DEFAULT_STORAGE_PREPROD = '10Gi'
     DEFAULT_STORAGE_PROD = '50Gi'
     
-    # Replica Configuration
-    DEFAULT_REPLICAS_TEST = 1
-    DEFAULT_REPLICAS_PREPROD = 2
-    DEFAULT_REPLICAS_PROD = 3
-    
     # Progress Display
     PROGRESS_DECIMAL_PLACES = 1
     
@@ -222,7 +217,7 @@ def retry_with_exponential_backoff(max_attempts=None, initial_delay=None, max_de
                     if attempt == max_attempts - 1:
                         break
                     
-                    print(f"⚠️  Attempt {attempt + 1}/{max_attempts} failed: {e}. Retrying in {delay:.1f}s...")
+                    print(f"Attempt {attempt + 1}/{max_attempts} failed: {e}. Retrying in {delay:.1f}s...")
                     time.sleep(delay)
                     
                     # Exponential backoff with jitter
@@ -398,8 +393,8 @@ class GitAuthManager:
         
         # Validate SSH key exists
         if not os.path.exists(private_key_path):
-            print(f"⚠️  SSH key not found at: {private_key_path}")
-            print(f"💡 Please ensure SSH key exists or update path in config")
+            print(f"SSH key not found at: {private_key_path}")
+            print(f"Please ensure SSH key exists or update path in config")
         
         # Convert HTTPS URL to SSH if needed
         if self.repository.startswith('https://'):
@@ -490,7 +485,7 @@ def timeout_handler(timeout_seconds=None):
             
             if thread.is_alive():
                 # Function is still running, timeout occurred
-                print(f"⏰ Operation timed out after {timeout_seconds} seconds")
+                print(f"Operation timed out after {timeout_seconds} seconds")
                 # Note: We cannot forcefully kill the thread, but we can return timeout error
                 raise TimeoutError(f"Function '{func.__name__}' timed out after {timeout_seconds} seconds")
             
@@ -516,6 +511,36 @@ class NamespaceConfig:
     resources: Dict[str, List[str]]  # resource_type -> [file_names]
     cluster_mapping: ClusterMapping
 
+
+class ErrorHandler:
+    """Centralized error handling with consistent patterns"""
+    
+    @staticmethod
+    def handle_critical_error(error: Exception, context: str, exit_code: int = 1):
+        """Handle critical errors that should stop execution"""
+        print(f"Critical error in {context}: {error}")
+        sys.exit(exit_code)
+    
+    @staticmethod
+    def handle_warning_error(error: Exception, context: str, fallback_action: str = None):
+        """Handle warning errors that allow continuation"""
+        print(f"Warning in {context}: {error}")
+        if fallback_action:
+            print(f"{fallback_action}")
+    
+    @staticmethod
+    def handle_network_error(error: Exception, context: str):
+        """Handle network errors with retry suggestion"""
+        print(f"Network error in {context}: {error}")
+        print("This may be a temporary network issue - retrying...")
+    
+    @staticmethod
+    def handle_file_error(error: Exception, context: str, file_path: str = None):
+        """Handle file operation errors"""
+        file_info = f" for {file_path}" if file_path else ""
+        print(f"File error in {context}{file_info}: {error}")
+
+
 @dataclass 
 class ProcessingResult:
     """Track processing results and errors"""
@@ -537,21 +562,21 @@ class ProcessingResult:
         return len(self.failed_files) > 0
     
     def print_summary(self):
-        print(f"\n📊 Processing Summary:")
-        print(f"   ✅ Success: {len(self.success_files)} files")
-        print(f"   ❌ Failed: {len(self.failed_files)} files")
-        print(f"   ⚠️  Warnings: {len(self.warnings)}")
-        print(f"   📦 Namespaces: {len(self.namespaces_found)}")
+        print(f"\nProcessing Summary:")
+        print(f"   Success: {len(self.success_files)} files")
+        print(f"   Failed: {len(self.failed_files)} files")
+        print(f"   Warnings: {len(self.warnings)}")
+        print(f"   Namespaces: {len(self.namespaces_found)}")
         
         if self.failed_files:
-            print(f"\n❌ Failed Files:")
+            print(f"\nFailed Files:")
             for filename, error in self.failed_files[:Constants.MAX_FAILED_FILES_DISPLAY]:
                 print(f"   • {filename}: {error}")
             if len(self.failed_files) > Constants.MAX_FAILED_FILES_DISPLAY:
                 print(f"   • ... and {len(self.failed_files) - Constants.MAX_FAILED_FILES_DISPLAY} more")
         
         if self.warnings:
-            print(f"\n⚠️  Warnings:")
+            print(f"\nWarnings:")
             for warning in self.warnings[:Constants.MAX_WARNINGS_DISPLAY]:
                 print(f"   • {warning}")
             if len(self.warnings) > Constants.MAX_WARNINGS_DISPLAY:
@@ -595,9 +620,9 @@ class MinioHandler:
         try:
             # Simple connectivity test
             buckets = list(self.minio_client.list_buckets())
-            print(f"✅ Minio connection successful. Found {len(buckets)} buckets.")
+            print(f"Minio connection successful. Found {len(buckets)} buckets.")
         except Exception as e:
-            print(f"❌ Minio connection test failed: {e}")
+            ErrorHandler.handle_network_error(e, "Minio connection test")
             raise MinioConnectionError(f"Failed to connect to Minio: {e}")
     
     @retry_with_exponential_backoff()
@@ -614,7 +639,7 @@ class MinioHandler:
             )
             return objects
         except Exception as e:
-            print(f"⚠️  Error listing objects from bucket '{bucket_name}' with prefix '{prefix}': {e}")
+            print(f"Error listing objects from bucket '{bucket_name}' with prefix '{prefix}': {e}")
             raise NetworkError(f"Failed to list objects: {e}")
     
     @retry_with_exponential_backoff()
@@ -626,7 +651,7 @@ class MinioHandler:
             response = self.minio_client.get_object(bucket_name, object_name)
             return response
         except Exception as e:
-            print(f"⚠️  Error downloading object '{object_name}' from bucket '{bucket_name}': {e}")
+            print(f"Error downloading object '{object_name}' from bucket '{bucket_name}': {e}")
             raise NetworkError(f"Failed to download object: {e}")
 
 
@@ -760,7 +785,7 @@ class FileManager:
                 
                 # Atomic rename
                 temp_path.replace(file_path)
-                print(f"✅ Generated {description}: {file_path}")
+                print(f"Generated {description}: {file_path}")
                 
             except Exception as e:
                 # Clean up temp file if something went wrong
@@ -818,17 +843,17 @@ class FileManager:
                 if os.path.exists(temp_file):
                     os.unlink(temp_file)
             except Exception as e:
-                print(f"⚠️  Warning: Could not cleanup temp file {temp_file}: {e}")
+                ErrorHandler.handle_file_error(e, "temp file cleanup", temp_file)
         
         self._temp_files.clear()
-        print("🧹 File cleanup completed")
+        print("File cleanup completed")
 
 
 class MinioGitOpsGenerator:
     """Main orchestrator class that coordinates MinioHandler, ValidationManager, and FileManager"""
     
     def __init__(self, minio_config: dict, cluster_mappings: dict, git_repo: str, 
-                 environments: List[str] = None, base_env: str = None):
+                 full_config: dict = None, environments: List[str] = None, base_env: str = None):
         
         # Initialize component managers
         self.minio_handler = MinioHandler(minio_config)
@@ -837,6 +862,7 @@ class MinioGitOpsGenerator:
         # Core configuration
         self.git_repo = git_repo
         self.cluster_mappings = cluster_mappings
+        self.full_config = full_config or {}
         self.namespaces: List[NamespaceConfig] = []
         
         # Configurable environments
@@ -864,7 +890,23 @@ class MinioGitOpsGenerator:
         if self.base_env not in self.environments:
             raise ConfigurationError(f"Base environment '{self.base_env}' not in configured environments: {self.environments}")
             
-        print(f"✅ Environment configuration validated: {self.environments} (base: {self.base_env})")
+        print(f"Environment configuration validated: {self.environments} (base: {self.base_env})")
+    
+    def _get_environment_config(self, env: str) -> dict:
+        """Get environment-specific configuration with fallbacks"""
+        env_config = self.full_config.get('environments', {}).get(env, {})
+        
+        # Default values based on environment type
+        defaults = {
+            'sync_policy': 'automated' if env in ['dev', 'test'] else 'manual',
+            'replicas': {'dev': 1, 'test': 1, 'preprod': 2, 'prod': 3}.get(env, 1)
+        }
+        
+        # Merge config with defaults
+        result = defaults.copy()
+        result.update(env_config)
+        
+        return result
     
     def __enter__(self):
         """Context manager entry"""
@@ -883,7 +925,7 @@ class MinioGitOpsGenerator:
         # Cleanup git credential helper
         self._cleanup_git_credential_helper()
         
-        print("🧹 Resource cleanup completed")
+        print("Resource cleanup completed")
     
     def _safe_write_file(self, file_path: Path, content: str, description: str = "file"):
         """Safely write content to file with comprehensive error handling"""
@@ -911,7 +953,7 @@ class MinioGitOpsGenerator:
                 
                 # Atomic rename
                 temp_path.replace(file_path)
-                print(f"✅ Generated {description}: {file_path}")
+                print(f"Generated {description}: {file_path}")
                 
             except Exception as e:
                 # Clean up temp file if something went wrong
@@ -1054,14 +1096,14 @@ class MinioGitOpsGenerator:
     @timeout_handler(timeout_seconds=Constants.MAX_MINIO_TIMEOUT)
     def scan_minio_bucket(self) -> Tuple[List[NamespaceConfig], ProcessingResult]:
         """Scan Minio bucket and detect namespaces with their resources"""
-        print(f"🔍 Scanning Minio bucket: {self.minio_handler.bucket_name}/{self.minio_handler.bucket_prefix}")
+        print(f"Scanning Minio bucket: {self.minio_handler.bucket_name}/{self.minio_handler.bucket_prefix}")
         
         namespace_resources = {}
         result = ProcessingResult()
         
         try:
             # Memory-optimized batch processing approach
-            print("📋 Processing objects in memory-efficient batches...")
+            print("Processing objects in memory-efficient batches...")
             
             batch_size = Constants.MEMORY_BATCH_SIZE
             batch = []
@@ -1089,21 +1131,21 @@ class MinioGitOpsGenerator:
             if batch:
                 processed_count += self._process_object_batch(batch, namespace_resources, result, processed_count, total_objects)
                 
-            print(f"📄 Total processed: {processed_count}/{total_objects} objects")
+            print(f"Total processed: {processed_count}/{total_objects} objects")
         
         except S3Error as e:
             error_msg = f"Failed to connect to Minio: {e}"
             result.add_failure("minio_connection", error_msg)
-            print(f"❌ {error_msg}")
+            print(f"{error_msg}")
             # Don't exit, return empty result
             return [], result
         except MinioConnectionError as e:
             result.add_failure("minio_connection", str(e))
-            print(f"❌ Minio Connection Error: {e}")
+            print(f"Minio Connection Error: {e}")
             return [], result
         except TimeoutError as e:
             result.add_failure("timeout", str(e))
-            print(f"⏰ Timeout Error: {e}")
+            print(f"Timeout Error: {e}")
             return [], result
         except RetryExhaustedError as e:
             result.add_failure("retry_exhausted", str(e))
@@ -1111,12 +1153,12 @@ class MinioGitOpsGenerator:
             return [], result
         except NetworkError as e:
             result.add_failure("network_error", str(e))
-            print(f"🌐 Network Error: {e}")
+            print(f"Network Error: {e}")
             return [], result
         except Exception as e:
             error_msg = f"Unexpected error during bucket scan: {e}"
             result.add_failure("bucket_scan", error_msg)
-            print(f"❌ {error_msg}")
+            print(f"{error_msg}")
             return [], result
         
         # Validate namespace and file limits
@@ -1124,7 +1166,7 @@ class MinioGitOpsGenerator:
             ValidationManager.validate_namespace_limits(namespace_resources)
         except ValidationError as e:
             result.add_failure("validation", str(e))
-            print(f"❌ Validation Error: {e}")
+            print(f"Validation Error: {e}")
             return [], result
         
         # Convert to NamespaceConfig objects
@@ -1143,7 +1185,7 @@ class MinioGitOpsGenerator:
                 cluster_mapping=cluster_mapping
             ))
         
-        print(f"✅ Detected {len(self.namespaces)} namespaces: {[ns.name for ns in self.namespaces]}")
+        print(f"Detected {len(self.namespaces)} namespaces: {[ns.name for ns in self.namespaces]}")
         return self.namespaces, result
     
     def _process_object_batch(self, batch: list, namespace_resources: dict, result: ProcessingResult, 
@@ -1188,15 +1230,15 @@ class MinioGitOpsGenerator:
                 # Progress indicator
                 if current_count % Constants.PROGRESS_UPDATE_INTERVAL == 0 or current_count == total_objects:
                     progress = (current_count / total_objects) * 100
-                    print(f"📊 Progress: {current_count}/{total_objects} ({progress:.{Constants.PROGRESS_DECIMAL_PLACES}f}%) - Found: {namespace}/{resource_type}/{filename}")
+                    print(f"Progress: {current_count}/{total_objects} ({progress:.{Constants.PROGRESS_DECIMAL_PLACES}f}%) - Found: {namespace}/{resource_type}/{filename}")
                 elif current_count % 20 == 0:  # Show less frequent updates to reduce noise
-                    print(f"📄 Found: {namespace}/{resource_type}/{filename}")
+                    print(f"Found: {namespace}/{resource_type}/{filename}")
                 
                 batch_processed += 1
                 
             except Exception as e:
                 result.add_failure(obj.object_name, str(e))
-                print(f"⚠️  Error processing {obj.object_name}: {e}")
+                print(f"Error processing {obj.object_name}: {e}")
                 continue  # Continue with next file
         
         return batch_processed
@@ -1219,22 +1261,22 @@ class MinioGitOpsGenerator:
                 docs = list(yaml.safe_load_all(f))
                 
         except FileNotFoundError as e:
-            print(f"❌ File not found: {e}")
+            print(f"File not found: {e}")
             return False
         except PermissionError as e:
-            print(f"❌ Permission denied accessing file {file_path}: {e}")
+            print(f"Permission denied accessing file {file_path}: {e}")
             return False
         except UnicodeDecodeError as e:
-            print(f"❌ Invalid file encoding for {file_path}: {e}")
+            print(f"Invalid file encoding for {file_path}: {e}")
             return False
         except OSError as e:
-            print(f"❌ OS error reading file {file_path}: {e}")
+            print(f"OS error reading file {file_path}: {e}")
             return False
         except yaml.YAMLError as e:
-            print(f"❌ YAML parsing error in {file_path}: {e}")
+            print(f"YAML parsing error in {file_path}: {e}")
             return False
         except Exception as e:
-            print(f"❌ Unexpected error validating {file_path}: {e}")
+            print(f"Unexpected error validating {file_path}: {e}")
             return False
         
         try:
@@ -1245,7 +1287,7 @@ class MinioGitOpsGenerator:
                     
                 # Check for basic K8s structure
                 if not isinstance(doc, dict):
-                    print(f"⚠️  Document {i} in {file_path.name} is not a dictionary")
+                    print(f"Document {i} in {file_path.name} is not a dictionary")
                     return False
                 
                 # Warn about remaining problematic metadata
@@ -1253,21 +1295,21 @@ class MinioGitOpsGenerator:
                     problematic_fields = ['uid', 'resourceVersion', 'managedFields']
                     found_issues = [f for f in problematic_fields if f in doc['metadata']]
                     if found_issues:
-                        print(f"⚠️  Document {i} in {file_path.name} still contains: {found_issues}")
+                        print(f"Document {i} in {file_path.name} still contains: {found_issues}")
                         return False
                 
                 # Check for status section
                 if 'status' in doc:
-                    print(f"⚠️  Document {i} in {file_path.name} still contains status section")
+                    print(f"Document {i} in {file_path.name} still contains status section")
                     return False
                     
             return True
             
         except yaml.YAMLError as e:
-            print(f"❌ YAML validation failed for {file_path}: {e}")
+            print(f"YAML validation failed for {file_path}: {e}")
             raise YAMLProcessingError(f"YAML validation failed for {file_path}: {e}") from e
         except Exception as e:
-            print(f"❌ Validation error for {file_path}: {e}")
+            print(f"Validation error for {file_path}: {e}")
             raise YAMLProcessingError(f"Validation error for {file_path}: {e}") from e
     
     def _safe_parse_path(self, object_path: str, prefix: str) -> Tuple[str, str] or None:
@@ -1313,7 +1355,7 @@ class MinioGitOpsGenerator:
             return namespace, filename
             
         except Exception as e:
-            print(f"⚠️  Path parsing error for {object_path}: {e}")
+            print(f"Path parsing error for {object_path}: {e}")
             return None
     
     def _is_valid_namespace_name(self, name: str) -> bool:
@@ -1337,7 +1379,7 @@ class MinioGitOpsGenerator:
                 if category != 'other':
                     return category
             except Exception as e:
-                print(f"⚠️  Could not parse YAML content for {filename}: {e}")
+                print(f"Could not parse YAML content for {filename}: {e}")
                 
         # Fallback to enhanced filename analysis
         return self._categorize_by_filename(filename)
@@ -1425,7 +1467,7 @@ class MinioGitOpsGenerator:
                 return category
                 
         # Still return 'other' but log for investigation
-        print(f"⚠️  Unrecognized resource type for file: {filename}")
+        print(f"Unrecognized resource type for file: {filename}")
         return 'other'
     
     def download_resources(self) -> ProcessingResult:
@@ -1443,7 +1485,7 @@ class MinioGitOpsGenerator:
                     resource_dir.mkdir(parents=True, exist_ok=True)
                 except Exception as e:
                     result.add_failure(f"create_directory_{resource_dir}", str(e))
-                    print(f"❌ Failed to create directory {resource_dir}: {e}")
+                    print(f"Failed to create directory {resource_dir}: {e}")
                     continue
                 
                 for filename in filenames:
@@ -1466,11 +1508,11 @@ class MinioGitOpsGenerator:
                             # Re-categorize with content analysis
                             better_category = self._categorize_resource(local_path.name, file_content)
                             if better_category != resource_type:
-                                print(f"🔍 Improved categorization: {local_path.name} {resource_type} → {better_category}")
+                                print(f"Improved categorization: {local_path.name} {resource_type} → {better_category}")
                                 # Update category if needed (would require refactoring, for now just log)
                                 
                         except Exception as e:
-                            print(f"⚠️  Could not re-categorize {local_path.name}: {e}")
+                            print(f"Could not re-categorize {local_path.name}: {e}")
                         
                         # Clean up Kubernetes metadata
                         cleanup_success = self._cleanup_k8s_metadata(local_path)
@@ -1482,15 +1524,15 @@ class MinioGitOpsGenerator:
                                 result.add_warning(f"YAML validation failed for {local_path} after cleanup")
                         
                         result.add_success(str(local_path))
-                        print(f"📄 Downloaded: {minio_path} → {local_path}")
+                        print(f"Downloaded: {minio_path} → {local_path}")
                         
                     except S3Error as e:
                         result.add_failure(minio_path, f"Minio error: {e}")
-                        print(f"❌ Failed to download {minio_path}: {e}")
+                        print(f"Failed to download {minio_path}: {e}")
                         continue
                     except Exception as e:
                         result.add_failure(minio_path, f"Unexpected error: {e}")
-                        print(f"❌ Unexpected error downloading {minio_path}: {e}")
+                        print(f"Unexpected error downloading {minio_path}: {e}")
                         continue
         
         return result
@@ -1507,7 +1549,7 @@ class MinioGitOpsGenerator:
             return self._builtin_cleanup_k8s_metadata(file_path)
                 
         except Exception as e:
-            print(f"❌ Cleanup failed for {file_path}: {e}")
+            print(f"Cleanup failed for {file_path}: {e}")
             return False
     
     def _try_advanced_cleanup(self, file_path: Path) -> bool:
@@ -1518,17 +1560,17 @@ class MinioGitOpsGenerator:
             success = cleaner.clean_yaml_file(file_path)
             
             if success:
-                print(f"🧹 Advanced cleanup completed: {file_path.name}")
+                print(f"Advanced cleanup completed: {file_path.name}")
                 return True
             else:
-                print(f"⚠️  Advanced cleanup reported failure for: {file_path.name}")
+                print(f"Advanced cleanup reported failure for: {file_path.name}")
                 return False
                 
         except ImportError:
-            print(f"📄 Advanced cleaner not available for {file_path.name}")
+            print(f"Advanced cleaner not available for {file_path.name}")
             return False
         except Exception as e:
-            print(f"⚠️  Advanced cleanup error for {file_path.name}: {e}")
+            print(f"Advanced cleanup error for {file_path.name}: {e}")
             return False
             
     def _builtin_cleanup_k8s_metadata(self, file_path: Path) -> bool:
@@ -1572,12 +1614,12 @@ class MinioGitOpsGenerator:
             return True
                 
         except Exception as e:
-            print(f"⚠️  Warning: Could not clean metadata from {file_path}: {e}")
+            print(f"Warning: Could not clean metadata from {file_path}: {e}")
             return False
     
     def generate_gitops_structure(self) -> None:
         """Generate complete GitOps structure for all namespaces"""
-        print("🏗️  Generating GitOps structure...")
+        print("Generating GitOps structure...")
         
         for namespace in self.namespaces:
             self._generate_namespace_structure(namespace)
@@ -1585,11 +1627,11 @@ class MinioGitOpsGenerator:
         # Generate root README
         self._generate_root_readme()
         
-        print("✅ GitOps structure generation complete!")
+        print("GitOps structure generation complete!")
     
     def _generate_namespace_structure(self, namespace: NamespaceConfig) -> None:
         """Generate complete structure for a single namespace"""
-        print(f"📦 Generating structure for namespace: {namespace.name}")
+        print(f"Generating structure for namespace: {namespace.name}")
         
         # Create directory structure
         ns_path = Path(Constants.BASE_NAMESPACE_DIR) / namespace.name
@@ -1617,8 +1659,10 @@ class MinioGitOpsGenerator:
             # Get cluster mapping for this environment
             cluster = getattr(namespace.cluster_mapping, env)
             
-            # Determine sync policy (automated for first 2 envs, manual for others)
-            is_automated = self.environments.index(env) < 2
+            # Get environment-specific configuration from config.yaml
+            env_config = self._get_environment_config(env)
+            is_automated = env_config['sync_policy'] == 'automated'
+            
             sync_policy = {
                 'automated': {
                     'prune': is_automated, 
@@ -1671,7 +1715,7 @@ class MinioGitOpsGenerator:
             content = yaml.dump(app_manifest, default_flow_style=False, sort_keys=False)
             self.file_manager.safe_write_file(app_file, content, f"ArgoCD App for {env}")
             
-            print(f"📄 Generated ArgoCD App: {app_file}")
+            print(f"Generated ArgoCD App: {app_file}")
     
     def _detect_pvc_storage_requirements(self, namespace: NamespaceConfig) -> Dict[str, Dict[str, str]]:
         """Dynamically detect PVC storage requirements from namespace resources"""
@@ -1702,11 +1746,11 @@ class MinioGitOpsGenerator:
                             base_size = self._safe_get_storage_size(doc)
                             detected_pvcs.append((pvc_name, base_size))
             except yaml.YAMLError as e:
-                print(f"⚠️  YAML parsing error in PVC file {pvc_file}: {e}")
+                print(f"YAML parsing error in PVC file {pvc_file}: {e}")
                 # Fallback to filename
                 detected_pvcs.append((pvc_file.stem, Constants.DEFAULT_STORAGE_TEST))
             except Exception as e:
-                print(f"⚠️  Could not parse PVC file {pvc_file}: {e}")
+                print(f"Could not parse PVC file {pvc_file}: {e}")
                 # Fallback to filename  
                 detected_pvcs.append((pvc_file.stem, Constants.DEFAULT_STORAGE_TEST))
         
@@ -1730,7 +1774,7 @@ class MinioGitOpsGenerator:
                     storage_configs['preprod'][pvc_name] = Constants.DEFAULT_STORAGE_PREPROD
                     storage_configs['prod'][pvc_name] = Constants.DEFAULT_STORAGE_PROD
             except (yaml.YAMLError, KeyError, AttributeError, TypeError) as e:
-                print(f"⚠️  Warning: Could not parse PVC file {pvc_file.name}: {e}")
+                print(f"Warning: Could not parse PVC file {pvc_file.name}: {e}")
                 # Fallback to default sizes using constants
                 storage_configs['test'][pvc_name] = Constants.DEFAULT_STORAGE_TEST
                 storage_configs['preprod'][pvc_name] = Constants.DEFAULT_STORAGE_PREPROD
@@ -1812,14 +1856,9 @@ class MinioGitOpsGenerator:
     
     def _create_overlay_config(self, namespace: NamespaceConfig, env: str, dynamic_storage: dict) -> dict:
         """Create configuration for a single environment overlay"""
-        # Get replica count for environment (index-based mapping)
-        replica_mapping = [
-            Constants.DEFAULT_REPLICAS_TEST,
-            Constants.DEFAULT_REPLICAS_PREPROD, 
-            Constants.DEFAULT_REPLICAS_PROD
-        ]
-        env_index = self.environments.index(env) - 1  # -1 because base env is excluded
-        replicas = replica_mapping[min(env_index, len(replica_mapping) - 1)]
+        # Get environment-specific configuration from config.yaml
+        env_config = self._get_environment_config(env)
+        replicas = env_config['replicas']
         
         return {
             'namespace': f"{namespace.name}-{env}",
@@ -1898,10 +1937,10 @@ class MinioGitOpsGenerator:
 
 Auto-generated from Minio bucket. This namespace contains {total_resources} resources.
 
-## 🎯 Resources
+## Resources
 {resource_summary}
 
-## 🌐 Environment → Cluster Mapping
+## Environment → Cluster Mapping
 
 | Environment | Target Cluster | Namespace | Sync Policy |
 |------------|----------------|-----------|-------------|
@@ -1910,7 +1949,7 @@ Auto-generated from Minio bucket. This namespace contains {total_resources} reso
 | **preprod** | `{namespace.cluster_mapping.preprod}` | `{namespace.name}-preprod` | Manual |
 | **prod** | `{namespace.cluster_mapping.prod}` | `{namespace.name}` | Manual |
 
-## 🚀 Deployment
+## Deployment
 
 ### Development
 ```bash
@@ -1934,7 +1973,7 @@ kubectl apply -f namespaces/{namespace.name}/argocd-apps/prod.yaml
 argocd app sync {namespace.name}-prod
 ```
 
-## 🔍 Resource Status
+## Resource Status
 
 ```bash
 # Development
@@ -1971,27 +2010,27 @@ kubectl get all,pvc,routes,configmaps -n {namespace.name}
 
 Auto-generated GitOps structure from Minio bucket with {len(self.namespaces)} namespaces.
 
-## 🏗️ Structure
+## Structure
 
 ```
 namespaces/
 {chr(10).join([f"├── {ns.name}/" for ns in self.namespaces])}
 ```
 
-## 📦 Namespaces
+## Namespaces
 
 | Namespace | Resources | Documentation |
 |-----------|-----------|---------------|
 {namespace_table}
 
-## 🌐 Cluster Mappings
+## Cluster Mappings
 
 - **dev**: Development environment 
 - **test**: Testing environment
 - **preprod**: Pre-production environment  
 - **prod**: Production environment
 
-## 🚀 Quick Deployment
+## Quick Deployment
 
 ```bash
 # Deploy all dev environments
@@ -2001,7 +2040,7 @@ namespaces/
 {chr(10).join([f'kubectl apply -f namespaces/{ns.name}/argocd-apps/test.yaml' for ns in self.namespaces])}
 ```
 
-## 📋 Prerequisites
+## Prerequisites
 
 ### ArgoCD Cluster Registration
 ```bash
@@ -2025,7 +2064,7 @@ argocd cluster add prod-context --name prod-cluster
         auth_manager = GitAuthManager(git_config)
         clean_url = auth_manager.setup_authentication()
         
-        print(f"🔧 Setting up Git repository with {git_config.get('auth_method', 'ssh')} authentication...")
+        print(f"Setting up Git repository with {git_config.get('auth_method', 'ssh')} authentication...")
         
         try:
     
@@ -2043,7 +2082,7 @@ argocd cluster add prod-context --name prod-cluster
             if result.returncode != 0:
                 # Initialize git repository
                 subprocess.run(['git', 'init'], check=True)
-                print("📁 Initialized new Git repository")
+                print("Initialized new Git repository")
             
             # Add/update remote origin
             try:
@@ -2108,7 +2147,7 @@ fi
         self._askpass_script_path = askpass_path
         self._temp_files.append(askpass_path)  # Track for cleanup
         
-        print("🔐 Configured secure git credential helper")
+        print("Configured secure git credential helper")
     
     def _cleanup_git_credential_helper(self):
         """Cleanup temporary askpass script"""
@@ -2116,11 +2155,11 @@ fi
     
             try:
                 os.unlink(self._askpass_script_path)
-                print("🧹 Cleaned up temporary credential helper")
+                print("Cleaned up temporary credential helper")
             except FileNotFoundError:
                 pass  # Already cleaned up
             except Exception as e:
-                print(f"⚠️  Warning: Could not cleanup askpass script: {e}")
+                ErrorHandler.handle_file_error(e, "git askpass script cleanup", self._askpass_script_path)
     
     def commit_and_push_changes(self, git_config: dict):
         """Commit and push changes to git repository"""
@@ -2129,18 +2168,18 @@ fi
         try:
             # Add all files
             subprocess.run(['git', 'add', '.'], check=True)
-            print("📄 Added all files to git staging")
+            print("Added all files to git staging")
             
             # Check if there are changes to commit
             result = subprocess.run(['git', 'diff', '--cached', '--quiet'], capture_output=True)
             if result.returncode == 0:
-                print("ℹ️  No changes to commit")
+                print("ℹNo changes to commit")
                 return
             
             # Commit changes
             commit_message = f"""Auto-generated GitOps structure from Minio bucket
 
-📦 Generated {len(self.namespaces)} namespace(s):
+Generated {len(self.namespaces)} namespace(s):
 {chr(10).join([f"   • {ns.name}: {sum(len(files) for files in ns.resources.values())} resources" for ns in self.namespaces])}
 
 🤖 Generated with [Claude Code](https://claude.ai/code)
@@ -2148,11 +2187,11 @@ fi
 Co-Authored-By: Claude <noreply@anthropic.com>"""
             
             subprocess.run(['git', 'commit', '-m', commit_message], check=True)
-            print("✅ Committed changes to git")
+            print("Committed changes to git")
             
             # Push changes
             auth_method = git_config.get('auth_method', 'ssh')
-            print(f"🚀 Pushing to remote repository using {auth_method} authentication...")
+            print(f"Pushing to remote repository using {auth_method} authentication...")
             
             result = subprocess.run(['git', 'push', 'origin', 'main'], capture_output=True, text=True)
             if result.returncode != 0:
@@ -2161,7 +2200,7 @@ Co-Authored-By: Claude <noreply@anthropic.com>"""
                 if result.returncode != 0:
                     raise subprocess.CalledProcessError(result.returncode, 'git push', result.stderr)
             
-            print("🎉 Successfully pushed changes to remote repository!")
+            print("Successfully pushed changes to remote repository!")
             
         except subprocess.CalledProcessError as e:
             error_msg = f"Git operation failed: {e}"
@@ -2241,7 +2280,7 @@ def load_config(config_path='config.yaml', validate_env=True):
             env_used.append(env_var)
     
     if env_used:
-        print(f"🔐 Using environment variables: {', '.join(env_used)}")
+        print(f"Using environment variables: {', '.join(env_used)}")
     
     # Validate required fields
     required_fields = [
@@ -2287,7 +2326,7 @@ def create_backup(backup_name=None):
     
     namespaces_dir = Path(Constants.BASE_NAMESPACE_DIR)
     if not namespaces_dir.exists():
-        print("📁 No existing namespaces directory to backup")
+        print("No existing namespaces directory to backup")
         return None
     
     if not backup_name:
@@ -2297,10 +2336,10 @@ def create_backup(backup_name=None):
     backup_dir = Path(backup_name)
     try:
         shutil.copytree(namespaces_dir, backup_dir)
-        print(f"💾 Created backup: {backup_dir}")
+        print(f"Created backup: {backup_dir}")
         return backup_dir
     except Exception as e:
-        print(f"⚠️  Backup creation failed: {e}")
+        print(f"Backup creation failed: {e}")
         return None
 
 def main():
@@ -2308,14 +2347,14 @@ def main():
     
     try:
         # Load configuration from file
-        print("📋 Loading configuration...")
+        print("Loading configuration...")
         minio_config, cluster_mappings, git_repo, full_config = load_config()
         
         # Extract git configuration
         git_config = full_config.get('git', {})
         auth_method = git_config.get('auth_method', 'ssh')
         
-        print(f"✅ Configuration loaded successfully:")
+        print(f"Configuration loaded successfully:")
         print(f"   • Minio: {minio_config['endpoint']}")
         print(f"   • Bucket: {minio_config['bucket']}")
         print(f"   • Git repo: {git_repo}")
@@ -2324,20 +2363,15 @@ def main():
         # Create backup if namespaces directory exists
         backup_dir = create_backup()
         
-    except Exception as e:
-        print(f"❌ Configuration error: {e}")
-        print("💡 Make sure config.yaml exists and is properly formatted")
-        sys.exit(1)
-    
-    # Initialize generator with context manager for automatic resource cleanup
-    with MinioGitOpsGenerator(minio_config, cluster_mappings, git_repo) as generator:
-        overall_result = ProcessingResult()
+        # Initialize generator with context manager for automatic resource cleanup
+        with MinioGitOpsGenerator(minio_config, cluster_mappings, git_repo, full_config) as generator:
+            overall_result = ProcessingResult()
         
         try:
-            print("🚀 Starting Minio to GitOps generation...")
+            print("Starting Minio to GitOps generation...")
             
             # Step 1: Scan Minio bucket to detect namespaces and resources
-            print("\n📋 Step 1: Scanning Minio bucket...")
+            print("\nStep 1: Scanning Minio bucket...")
             namespaces, scan_result = generator.scan_minio_bucket()
             overall_result.success_files.extend(scan_result.success_files)
             overall_result.failed_files.extend(scan_result.failed_files)
@@ -2345,9 +2379,9 @@ def main():
         
             # Check if we found any namespaces
             if not namespaces:
-                print("❌ No namespaces found in Minio bucket!")
+                print("No namespaces found in Minio bucket!")
                 if scan_result.has_failures():
-                    print("💡 This might be due to connection issues or path structure problems")
+                    print("This might be due to connection issues or path structure problems")
                     scan_result.print_summary()
                 sys.exit(1)
         
@@ -2361,12 +2395,12 @@ def main():
                 overall_result.warnings.extend(download_result.warnings)
         
             # Step 3: Generate complete GitOps structure
-            print("\n🏗️  Step 3: Generating GitOps structure...")
+            print("\nStep 3: Generating GitOps structure...")
             generator.generate_gitops_structure()
         
             # Print results
-            print("🎉 GitOps structure generation completed!")
-            print(f"📁 Generated {len(generator.namespaces)} namespaces:")
+            print("GitOps structure generation completed!")
+            print(f"Generated {len(generator.namespaces)} namespaces:")
             for ns in generator.namespaces:
                 resource_count = sum(len(files) for files in ns.resources.values())
                 print(f"   • {ns.name}: {resource_count} resources")
@@ -2376,28 +2410,28 @@ def main():
         
             # Setup git repository and push changes
             try:
-                print("\n🔧 Setting up Git repository...")
+                print("\nSetting up Git repository...")
                 generator.setup_git_repository(git_config)
             
-                print("📤 Committing and pushing changes...")
+                print("Committing and pushing changes...")
                 generator.commit_and_push_changes(git_config)
             
-                print("\n🎉 Successfully pushed GitOps structure to repository!")
+                print("\nSuccessfully pushed GitOps structure to repository!")
             
             except Exception as git_error:
-                print(f"\n⚠️  Git operation failed: {git_error}")
-                print("\n📝 Manual git steps (if needed):")
+                print(f"\nGit operation failed: {git_error}")
+                print("\nManual git steps (if needed):")
                 print("1. Review generated files")
                 print("2. git add .")
                 print("3. git commit -m 'Auto-generated GitOps structure'")
                 print("4. git push origin main")
         
         except Exception as e:
-            print(f"\n❌ Critical error: {e}")
+            print(f"\nCritical error: {e}")
             overall_result.add_failure("critical_error", str(e))
         
         # Show next steps
-        print("\n📋 Next steps:")
+        print("\nNext steps:")
         print("1. Review the generated namespaces/ directory")
         print("2. Update cluster endpoints in ArgoCD applications if needed")
         print("3. Register clusters in ArgoCD:")
@@ -2408,18 +2442,18 @@ def main():
         
         # Exit with appropriate code
         if overall_result.has_failures():
-            print("\n⚠️  Some files failed to process, but GitOps structure was generated")
+            print("\nSome files failed to process, but GitOps structure was generated")
             sys.exit(2)  # Warning exit code
         else:
-            print("\n✅ All files processed successfully!")
-            
+            print("\nAll files processed successfully!")
+    
     except KeyboardInterrupt:
-        print("\n⏹️  Operation cancelled by user")
+        print("\nOperation cancelled by user")
         sys.exit(130)  # Standard SIGINT exit code
     except Exception as e:
-        print(f"❌ Unexpected error: {e}")
+        print(f"Unexpected error: {e}")
         import traceback
-        print("🔍 Detailed error:")
+        print("Detailed error:")
         traceback.print_exc()
         sys.exit(1)
 
