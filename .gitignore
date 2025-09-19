@@ -110,6 +110,11 @@ dmypy.json
 *.backup
 *.bak
 
+# Test files (keep local, don't commit)
+*test*.py
+TEST_RESULTS.md
+run_all_tests.sh
+
 # IDE files
 .vscode/
 .idea/
