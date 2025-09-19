@@ -10,12 +10,19 @@ import os
 import sys
 import json
 import yaml
+import time
+import stat
+import tempfile
+import threading
+import subprocess
+import re
+import shutil
+import random
 from pathlib import Path
 from typing import Dict, List, Tuple
 from dataclasses import dataclass, field
 from minio import Minio
 from minio.error import S3Error
-import time
 import urllib3
 
 # Custom Exceptions for better error handling
@@ -153,6 +160,38 @@ class Constants:
     # Minio Connection Pool Settings
     MAX_POOL_CONNECTIONS = 10  # Maximum connections in pool
     MAX_POOL_SIZE = 20         # Maximum pool size
+    
+    # Git Platform Detection Patterns (configurable)
+    PLATFORM_PATTERNS = {
+        'azure_devops': [
+            'dev.azure.com',
+            'visualstudio.com'  # Legacy Azure DevOps URLs
+        ],
+        'github': [
+            'github.com',
+            'github.enterprise.com'  # GitHub Enterprise
+        ],
+        'gitlab': [
+            'gitlab.com',
+            'gitlab.',  # Self-hosted GitLab instances
+            'git.gitlab'
+        ],
+        'bitbucket': [
+            'bitbucket.org',
+            'bitbucket.enterprise.com'
+        ],
+        'gitea': [
+            'gitea.com',
+            'gitea.',  # Self-hosted Gitea instances
+        ],
+        'codecommit': [
+            'codecommit.',  # AWS CodeCommit
+            'git-codecommit'
+        ]
+    }
+    
+    # Default batch processing size
+    MEMORY_BATCH_SIZE = 100
 
 def retry_with_exponential_backoff(max_attempts=None, initial_delay=None, max_delay=None, backoff_factor=None):
     """Decorator for retrying functions with exponential backoff"""
@@ -189,7 +228,6 @@ def retry_with_exponential_backoff(max_attempts=None, initial_delay=None, max_de
                     # Exponential backoff with jitter
                     delay = min(delay * backoff_factor, max_delay)
                     # Add small jitter to prevent thundering herd
-                    import random
                     delay += random.uniform(0, delay * 0.1)
             
             raise RetryExhaustedError(f"All {max_attempts} retry attempts failed. Last error: {last_exception}")
@@ -219,7 +257,7 @@ class GitAuthManager:
             raise ConfigurationError(f"Unsupported auth method: {self.auth_method}")
     
     def _setup_pat_auth(self):
-        """Setup Personal Access Token authentication"""
+        """Setup Personal Access Token authentication with configurable platform detection"""
         pat_config = self.git_config.get('pat', {})
         token = pat_config.get('token', '')
         username = pat_config.get('username', '')
@@ -227,67 +265,85 @@ class GitAuthManager:
         if not token:
             raise ConfigurationError("PAT token is required but not provided")
         
-        # Determine platform and setup appropriate auth
-        if 'dev.azure.com' in self.repository:
+        # Determine platform using configurable patterns
+        platform = self._detect_platform()
+        
+        if platform == 'azure_devops':
             return self._setup_azure_devops_pat(token, username)
-        elif 'github.com' in self.repository:
+        elif platform == 'github':
             return self._setup_github_pat(token)
-        elif 'gitlab.com' in self.repository or 'gitlab' in self.repository:
+        elif platform == 'gitlab':
             return self._setup_gitlab_pat(token)
-        elif 'bitbucket.org' in self.repository:
+        elif platform == 'bitbucket':
             return self._setup_bitbucket_pat(token, username)
+        elif platform == 'gitea':
+            return self._setup_gitea_pat(token, username)
+        elif platform == 'codecommit':
+            return self._setup_codecommit_pat(token, username)
         else:
             # Generic HTTPS with token
             return self._setup_generic_pat(token, username)
     
+    def _detect_platform(self):
+        """Detect git platform using configurable patterns"""
+        repository_lower = self.repository.lower()
+        
+        # Check against configured platform patterns
+        for platform, patterns in Constants.PLATFORM_PATTERNS.items():
+            for pattern in patterns:
+                if pattern.lower() in repository_lower:
+                    return platform
+        
+        return 'generic'
+    
     def _setup_azure_devops_pat(self, token, username='any'):
-        """Setup Azure DevOps PAT authentication"""
+        """Setup Azure DevOps PAT authentication using secure credential storage"""
         if not username:
             username = 'any'  # Azure DevOps accepts any username with PAT
         
-        # Configure git credentials for Azure DevOps
-        import subprocess
-        try:
-            # Set credential helper for Azure DevOps
-            subprocess.run(['git', 'config', '--global', 'credential.https://dev.azure.com.helper', 'store'], check=True)
-            
-            # Create authenticated URL
-            auth_url = self.repository.replace('https://', f'https://{username}:{token}@')
-            return auth_url
-            
-        except subprocess.CalledProcessError as e:
-            raise ConfigurationError(f"Failed to configure Azure DevOps authentication: {e}")
+        # Use environment variables for secure credential handling
+        os.environ['GIT_USERNAME'] = username
+        os.environ['GIT_PASSWORD'] = token
+        
+        # Return clean URL without embedded credentials
+        return self.repository
     
     def _setup_github_pat(self, token):
-        """Setup GitHub PAT authentication"""
-        # GitHub doesn't require username for PAT, just token
-        auth_url = self.repository.replace('https://', f'https://{token}@')
-        return auth_url
+        """Setup GitHub PAT authentication using secure credential storage"""
+        os.environ['GIT_USERNAME'] = token  # GitHub uses token as username
+        os.environ['GIT_PASSWORD'] = ''     # No password needed
+        
+        return self.repository
     
     def _setup_gitlab_pat(self, token):
-        """Setup GitLab PAT authentication"""
-        # GitLab uses 'oauth2' as username for PAT
-        auth_url = self.repository.replace('https://', f'https://oauth2:{token}@')
-        return auth_url
+        """Setup GitLab PAT authentication using secure credential storage"""
+        os.environ['GIT_USERNAME'] = 'oauth2'  # GitLab uses 'oauth2' as username for PAT
+        os.environ['GIT_PASSWORD'] = token
+        
+        return self.repository
     
     def _setup_bitbucket_pat(self, token, username):
-        """Setup Bitbucket App Password authentication"""
+        """Setup Bitbucket App Password authentication using secure credential storage"""
         if not username:
             raise ConfigurationError("Bitbucket requires username for App Password authentication")
         
-        auth_url = self.repository.replace('https://', f'https://{username}:{token}@')
-        return auth_url
+        os.environ['GIT_USERNAME'] = username
+        os.environ['GIT_PASSWORD'] = token
+        
+        return self.repository
     
     def _setup_generic_pat(self, token, username='token'):
-        """Setup generic PAT authentication"""
+        """Setup generic PAT authentication using secure credential storage"""
         if not username:
             username = 'token'
         
-        auth_url = self.repository.replace('https://', f'https://{username}:{token}@')
-        return auth_url
+        os.environ['GIT_USERNAME'] = username
+        os.environ['GIT_PASSWORD'] = token
+        
+        return self.repository
     
     def _setup_basic_auth(self):
-        """Setup basic username/password authentication"""
+        """Setup basic username/password authentication using secure credential storage"""
         basic_config = self.git_config.get('basic', {})
         username = basic_config.get('username', '')
         password = basic_config.get('password', '')
@@ -295,14 +351,55 @@ class GitAuthManager:
         if not username or not password:
             raise ConfigurationError("Username and password are required for basic authentication")
         
-        auth_url = self.repository.replace('https://', f'https://{username}:{password}@')
-        return auth_url
+
+        os.environ['GIT_USERNAME'] = username
+        os.environ['GIT_PASSWORD'] = password
+        
+        return self.repository
+    
+    def _setup_gitea_pat(self, token, username):
+        """Setup Gitea PAT authentication using secure credential storage"""
+        if not username:
+            raise ConfigurationError("Gitea requires username for PAT authentication")
+        
+
+        os.environ['GIT_USERNAME'] = username
+        os.environ['GIT_PASSWORD'] = token
+        
+        return self.repository
+    
+    def _setup_codecommit_pat(self, token, username):
+        """Setup AWS CodeCommit PAT authentication using secure credential storage"""
+        if not username:
+            raise ConfigurationError("AWS CodeCommit requires username for PAT authentication")
+        
+
+        os.environ['GIT_USERNAME'] = username
+        os.environ['GIT_PASSWORD'] = token
+        
+        return self.repository
     
     def _setup_ssh_auth(self):
-        """Setup SSH key authentication"""
+        """Setup SSH key authentication with platform-agnostic path handling"""
         ssh_config = self.git_config.get('ssh', {})
-        private_key_path = ssh_config.get('private_key_path', '~/.ssh/id_rsa')
+        
+        # Platform-agnostic default SSH key path
+
+        if os.name == 'nt':  # Windows
+            default_ssh_path = os.path.expanduser('~\\.ssh\\id_rsa')
+        else:  # Unix/Linux/macOS
+            default_ssh_path = os.path.expanduser('~/.ssh/id_rsa')
+        
+        private_key_path = ssh_config.get('private_key_path', default_ssh_path)
         passphrase = ssh_config.get('passphrase', '')
+        
+        # Expand user path for cross-platform compatibility
+        private_key_path = os.path.expanduser(private_key_path)
+        
+        # Validate SSH key exists
+        if not os.path.exists(private_key_path):
+            print(f"⚠️  SSH key not found at: {private_key_path}")
+            print(f"💡 Please ensure SSH key exists or update path in config")
         
         # Convert HTTPS URL to SSH if needed
         if self.repository.startswith('https://'):
@@ -313,31 +410,52 @@ class GitAuthManager:
         return self.repository
     
     def _convert_https_to_ssh(self, https_url):
-        """Convert HTTPS URL to SSH format"""
-        import re
+        """Convert HTTPS URL to SSH format using platform detection"""
+
         
-        # GitHub pattern
-        if 'github.com' in https_url:
-            match = re.match(r'https://github\.com/([^/]+)/([^/]+)\.git', https_url)
+        platform = self._detect_platform()
+        
+        if platform == 'github':
+            # GitHub/GitHub Enterprise pattern
+            match = re.match(r'https://([^/]+)/([^/]+)/([^/]+)\.git', https_url)
             if match:
-                user, repo = match.groups()
-                return f'git@github.com:{user}/{repo}.git'
+                domain, user, repo = match.groups()
+                return f'git@{domain}:{user}/{repo}.git'
         
-        # GitLab pattern
-        elif 'gitlab.com' in https_url:
-            match = re.match(r'https://gitlab\.com/([^/]+)/([^/]+)\.git', https_url)
+        elif platform == 'gitlab':
+            # GitLab/self-hosted GitLab pattern
+            match = re.match(r'https://([^/]+)/([^/]+)/([^/]+)\.git', https_url)
             if match:
-                user, repo = match.groups()
-                return f'git@gitlab.com:{user}/{repo}.git'
+                domain, user, repo = match.groups()
+                return f'git@{domain}:{user}/{repo}.git'
         
-        # Azure DevOps pattern (more complex)
-        elif 'dev.azure.com' in https_url:
+        elif platform == 'azure_devops':
+            # Azure DevOps pattern
             match = re.match(r'https://dev\.azure\.com/([^/]+)/([^/]+)/_git/([^/]+)', https_url)
             if match:
                 org, project, repo = match.groups()
                 return f'git@ssh.dev.azure.com:v3/{org}/{project}/{repo}'
+            # Legacy visualstudio.com pattern
+            match = re.match(r'https://([^.]+)\.visualstudio\.com/([^/]+)/_git/([^/]+)', https_url)
+            if match:
+                account, project, repo = match.groups()
+                return f'git@vs-ssh.visualstudio.com:v3/{account}/{project}/{repo}'
         
-        # Generic pattern - keep as is
+        elif platform == 'bitbucket':
+            # Bitbucket pattern
+            match = re.match(r'https://bitbucket\.org/([^/]+)/([^/]+)\.git', https_url)
+            if match:
+                user, repo = match.groups()
+                return f'git@bitbucket.org:{user}/{repo}.git'
+        
+        elif platform == 'gitea':
+            # Gitea/self-hosted Gitea pattern
+            match = re.match(r'https://([^/]+)/([^/]+)/([^/]+)\.git', https_url)
+            if match:
+                domain, user, repo = match.groups()
+                return f'git@{domain}:{user}/{repo}.git'
+        
+        # Generic/CodeCommit - keep as HTTPS (SSH not typically used)
         return https_url
     
     def _setup_no_auth(self):
@@ -345,30 +463,42 @@ class GitAuthManager:
         return self.repository
 
 def timeout_handler(timeout_seconds=None):
-    """Decorator to add timeout handling to functions"""
+    """Platform-agnostic decorator to add timeout handling to functions"""
     if timeout_seconds is None:
         timeout_seconds = Constants.MAX_MINIO_TIMEOUT
     
     def decorator(func):
         def wrapper(*args, **kwargs):
-            import signal
             
-            def timeout_signal_handler(signum, frame):
+            # Use threading for cross-platform timeout support
+            result = [None]
+            exception = [None]
+            
+            def target():
+                try:
+                    result[0] = func(*args, **kwargs)
+                except Exception as e:
+                    exception[0] = e
+            
+            # Start the function in a separate thread
+            thread = threading.Thread(target=target)
+            thread.daemon = True
+            thread.start()
+            
+            # Wait for completion or timeout
+            thread.join(timeout_seconds)
+            
+            if thread.is_alive():
+                # Function is still running, timeout occurred
+                print(f"⏰ Operation timed out after {timeout_seconds} seconds")
+                # Note: We cannot forcefully kill the thread, but we can return timeout error
                 raise TimeoutError(f"Function '{func.__name__}' timed out after {timeout_seconds} seconds")
             
-            # Set the signal handler and alarm
-            old_handler = signal.signal(signal.SIGALRM, timeout_signal_handler)
-            signal.alarm(int(timeout_seconds))
+            # Check if an exception occurred
+            if exception[0]:
+                raise exception[0]
             
-            try:
-                result = func(*args, **kwargs)
-                signal.alarm(0)  # Disable the alarm
-                return result
-            except TimeoutError:
-                print(f"⏰ Operation timed out after {timeout_seconds} seconds")
-                raise
-            finally:
-                signal.signal(signal.SIGALRM, old_handler)  # Restore old handler
+            return result[0]
         
         return wrapper
     return decorator
@@ -427,9 +557,10 @@ class ProcessingResult:
             if len(self.warnings) > Constants.MAX_WARNINGS_DISPLAY:
                 print(f"   • ... and {len(self.warnings) - Constants.MAX_WARNINGS_DISPLAY} more")
 
-class MinioGitOpsGenerator:
-    def __init__(self, minio_config: dict, cluster_mappings: dict, git_repo: str, 
-                 environments: List[str] = None, base_env: str = None):
+class MinioHandler:
+    """Handles all Minio connection and object processing operations"""
+    
+    def __init__(self, minio_config: dict):
         # Configure connection pool for better performance and reliability
         http_client = urllib3.PoolManager(
             timeout=urllib3.Timeout(
@@ -457,6 +588,253 @@ class MinioGitOpsGenerator:
         self._test_minio_connection()
         self.bucket_name = minio_config['bucket']
         self.bucket_prefix = minio_config.get('prefix', '')
+    
+    @retry_with_exponential_backoff(max_attempts=2)  # Quick test, only 2 attempts
+    def _test_minio_connection(self):
+        """Test Minio connection during initialization"""
+        try:
+            # Simple connectivity test
+            buckets = list(self.minio_client.list_buckets())
+            print(f"✅ Minio connection successful. Found {len(buckets)} buckets.")
+        except Exception as e:
+            print(f"❌ Minio connection test failed: {e}")
+            raise MinioConnectionError(f"Failed to connect to Minio: {e}")
+    
+    @retry_with_exponential_backoff()
+    def list_objects(self, bucket_name: str = None, prefix: str = None, recursive: bool = True):
+        """List objects with retry logic and timeout handling"""
+        bucket_name = bucket_name or self.bucket_name
+        prefix = prefix or self.bucket_prefix
+        
+        try:
+            objects = self.minio_client.list_objects(
+                bucket_name, 
+                prefix=prefix,
+                recursive=recursive
+            )
+            return objects
+        except Exception as e:
+            print(f"⚠️  Error listing objects from bucket '{bucket_name}' with prefix '{prefix}': {e}")
+            raise NetworkError(f"Failed to list objects: {e}")
+    
+    @retry_with_exponential_backoff()
+    def get_object(self, object_name: str, bucket_name: str = None):
+        """Get object with retry logic and timeout handling"""
+        bucket_name = bucket_name or self.bucket_name
+        
+        try:
+            response = self.minio_client.get_object(bucket_name, object_name)
+            return response
+        except Exception as e:
+            print(f"⚠️  Error downloading object '{object_name}' from bucket '{bucket_name}': {e}")
+            raise NetworkError(f"Failed to download object: {e}")
+
+
+class ValidationManager:
+    """Handles all input validation and security checks"""
+    
+    @staticmethod
+    def validate_file_size(file_size: int, filename: str):
+        """Validate file size against security limits"""
+        max_size_bytes = Constants.MAX_FILE_SIZE_MB * 1024 * 1024
+        if file_size > max_size_bytes:
+            raise FileSizeError(f"File '{filename}' exceeds maximum size limit ({Constants.MAX_FILE_SIZE_MB}MB)")
+    
+    @staticmethod
+    def validate_filename(filename: str):
+        """Validate filename for security and format"""
+        if not filename:
+            raise ValidationError("Empty filename provided")
+        
+        # Check extension
+        file_path = Path(filename)
+        if file_path.suffix.lower() not in Constants.ALLOWED_YAML_EXTENSIONS:
+            raise ValidationError(f"Invalid file extension: {file_path.suffix}. Allowed: {Constants.ALLOWED_YAML_EXTENSIONS}")
+        
+        # Check for dangerous patterns in filename
+        filename_lower = filename.lower()
+        for pattern in Constants.DANGEROUS_PATTERNS:
+            if pattern in filename_lower:
+                raise SecurityError(f"Potentially dangerous pattern '{pattern}' found in filename: {filename}")
+    
+    @staticmethod
+    def validate_yaml_content(content: str, filename: str):
+        """Validate YAML content for security and size limits"""
+        if not content or not content.strip():
+            raise ContentValidationError(f"Empty or whitespace-only content in file: {filename}")
+        
+        # Check content size
+        content_size = len(content.encode('utf-8'))
+        max_size_bytes = Constants.MAX_FILE_SIZE_MB * 1024 * 1024
+        if content_size > max_size_bytes:
+            raise FileSizeError(f"Content size exceeds limit for file '{filename}': {content_size / (1024*1024):.1f}MB")
+        
+        # Check for dangerous patterns in content
+        content_lower = content.lower()
+        for pattern in Constants.DANGEROUS_PATTERNS:
+            if pattern in content_lower:
+                raise SecurityError(f"Potentially dangerous pattern '{pattern}' found in content of: {filename}")
+    
+    @staticmethod
+    def validate_yaml_structure(data: dict, filename: str, depth: int = 0):
+        """Recursively validate YAML structure for security limits"""
+        if depth > Constants.MAX_YAML_DEPTH:
+            raise ValidationError(f"YAML nesting depth exceeds limit ({Constants.MAX_YAML_DEPTH}) in file: {filename}")
+        
+        if isinstance(data, dict):
+            if len(data) > Constants.MAX_LIST_ITEMS:
+                raise ValidationError(f"Dictionary size exceeds limit ({Constants.MAX_LIST_ITEMS}) in file: {filename}")
+            
+            for key, value in data.items():
+                if isinstance(key, str) and len(key) > Constants.MAX_STRING_LENGTH:
+                    raise ValidationError(f"Key length exceeds limit in file: {filename}")
+                
+                if isinstance(value, str) and len(value) > Constants.MAX_STRING_LENGTH:
+                    raise ValidationError(f"Value length exceeds limit in file: {filename}")
+                
+                if isinstance(value, (dict, list)):
+                    ValidationManager.validate_yaml_structure(value, filename, depth + 1)
+        
+        elif isinstance(data, list):
+            if len(data) > Constants.MAX_LIST_ITEMS:
+                raise ValidationError(f"List size exceeds limit ({Constants.MAX_LIST_ITEMS}) in file: {filename}")
+            
+            for item in data:
+                if isinstance(item, (dict, list)):
+                    ValidationManager.validate_yaml_structure(item, filename, depth + 1)
+    
+    @staticmethod
+    def validate_kubernetes_name(name: str, resource_type: str = "resource"):
+        """Validate Kubernetes resource names according to RFC standards"""
+        if not name:
+            raise ValidationError(f"Empty {resource_type} name provided")
+        
+        if len(name) > 253:
+            raise ValidationError(f"{resource_type.capitalize()} name too long: {name}")
+        
+        # Kubernetes naming convention: lowercase letters, numbers, hyphens
+        if not re.match(r'^[a-z0-9]([a-z0-9\-]*[a-z0-9])?$', name):
+            raise ValidationError(f"Invalid {resource_type} name format: {name}")
+    
+    @staticmethod
+    def validate_namespace_limits(namespaces: dict):
+        """Validate namespace and file count limits"""
+        if len(namespaces) > Constants.MAX_NAMESPACES:
+            raise ValidationError(f"Too many namespaces: {len(namespaces)} (max: {Constants.MAX_NAMESPACES})")
+        
+        for ns_name, resources in namespaces.items():
+            ValidationManager.validate_kubernetes_name(ns_name, "namespace")
+            
+            if len(resources) > Constants.MAX_FILES_PER_NAMESPACE:
+                raise ValidationError(f"Too many files in namespace '{ns_name}': {len(resources)} (max: {Constants.MAX_FILES_PER_NAMESPACE})")
+
+
+class FileManager:
+    """Handles all file operations with safety and cleanup"""
+    
+    def __init__(self):
+        self._temp_files = []  # Track temporary files for cleanup
+    
+    def safe_write_file(self, file_path: Path, content: str, description: str = "file"):
+        """Safely write content to file with comprehensive error handling"""
+        try:
+            # Ensure parent directory exists
+            file_path.parent.mkdir(parents=True, exist_ok=True)
+            
+            # Check available disk space (basic check)
+            free_space = shutil.disk_usage(file_path.parent).free
+            content_size = len(content.encode('utf-8'))
+            
+            # Require at least 100MB free space or 10x content size, whichever is larger
+            min_free_space = max(100 * 1024 * 1024, content_size * 10)
+            if free_space < min_free_space:
+                raise OSError(f"Insufficient disk space for {description}: {free_space / (1024*1024):.1f}MB free")
+            
+            # Write content with atomic operation (write to temp then rename)
+            temp_path = file_path.with_suffix('.tmp')
+            try:
+                with open(temp_path, 'w', encoding='utf-8') as f:
+                    f.write(content)
+                    f.flush()  # Ensure content is written
+                    os.fsync(f.fileno())  # Force OS to write to disk
+                
+                # Atomic rename
+                temp_path.replace(file_path)
+                print(f"✅ Generated {description}: {file_path}")
+                
+            except Exception as e:
+                # Clean up temp file if something went wrong
+                if temp_path.exists():
+                    temp_path.unlink()
+                raise e
+                
+        except PermissionError as e:
+            raise OSError(f"Permission denied writing {description} to {file_path}: {e}")
+        except OSError as e:
+            raise OSError(f"OS error writing {description} to {file_path}: {e}")
+        except Exception as e:
+            raise Exception(f"Unexpected error writing {description} to {file_path}: {e}")
+    
+    def safe_read_file(self, file_path: Path, description: str = "file") -> str:
+        """Safely read file content with comprehensive error handling"""
+        try:
+            # Check file exists and is readable
+            if not file_path.exists():
+                raise FileNotFoundError(f"{description.capitalize()} does not exist: {file_path}")
+            
+            if not file_path.is_file():
+                raise ValueError(f"Path is not a file: {file_path}")
+            
+            # Check file size before opening
+            file_size = file_path.stat().st_size
+            ValidationManager.validate_file_size(file_size, str(file_path))
+            
+            with open(file_path, 'r', encoding='utf-8') as f:
+                content = f.read()
+                
+            # Validate content
+            ValidationManager.validate_yaml_content(content, str(file_path))
+            return content
+            
+        except FileNotFoundError as e:
+            raise FileNotFoundError(f"File not found: {e}")
+        except PermissionError as e:
+            raise PermissionError(f"Permission denied reading {description} {file_path}: {e}")
+        except UnicodeDecodeError as e:
+            raise ValueError(f"Invalid file encoding for {description} {file_path}: {e}")
+        except OSError as e:
+            raise OSError(f"OS error reading {description} {file_path}: {e}")
+        except Exception as e:
+            raise Exception(f"Unexpected error reading {description} {file_path}: {e}")
+    
+    def add_temp_file(self, temp_file_path: str):
+        """Add temporary file to cleanup list"""
+        self._temp_files.append(temp_file_path)
+    
+    def cleanup(self):
+        """Cleanup all tracked temporary files"""
+        for temp_file in self._temp_files:
+            try:
+                if os.path.exists(temp_file):
+                    os.unlink(temp_file)
+            except Exception as e:
+                print(f"⚠️  Warning: Could not cleanup temp file {temp_file}: {e}")
+        
+        self._temp_files.clear()
+        print("🧹 File cleanup completed")
+
+
+class MinioGitOpsGenerator:
+    """Main orchestrator class that coordinates MinioHandler, ValidationManager, and FileManager"""
+    
+    def __init__(self, minio_config: dict, cluster_mappings: dict, git_repo: str, 
+                 environments: List[str] = None, base_env: str = None):
+        
+        # Initialize component managers
+        self.minio_handler = MinioHandler(minio_config)
+        self.file_manager = FileManager()
+        
+        # Core configuration
         self.git_repo = git_repo
         self.cluster_mappings = cluster_mappings
         self.namespaces: List[NamespaceConfig] = []
@@ -464,6 +842,9 @@ class MinioGitOpsGenerator:
         # Configurable environments
         self.environments = environments or Constants.DEFAULT_ENVIRONMENTS
         self.base_env = base_env or Constants.DEFAULT_BASE_ENV
+        
+        # Resource management
+        self._askpass_script_path = None
         
         # Validate environments exist in cluster mappings
         self._validate_environment_configuration()
@@ -485,40 +866,24 @@ class MinioGitOpsGenerator:
             
         print(f"✅ Environment configuration validated: {self.environments} (base: {self.base_env})")
     
-    @retry_with_exponential_backoff(max_attempts=2)  # Quick test, only 2 attempts
-    def _test_minio_connection(self):
-        """Test Minio connection during initialization"""
-        try:
-            # Simple connectivity test
-            buckets = list(self.minio_client.list_buckets())
-            print(f"✅ Minio connection successful. Found {len(buckets)} buckets.")
-        except Exception as e:
-            print(f"❌ Minio connection test failed: {e}")
-            raise MinioConnectionError(f"Failed to connect to Minio: {e}")
+    def __enter__(self):
+        """Context manager entry"""
+        return self
     
-    @retry_with_exponential_backoff()
-    def _resilient_list_objects(self, bucket_name: str, prefix: str = "", recursive: bool = True):
-        """List objects with retry logic and timeout handling"""
-        try:
-            objects = self.minio_client.list_objects(
-                bucket_name, 
-                prefix=prefix,
-                recursive=recursive
-            )
-            return objects
-        except Exception as e:
-            print(f"⚠️  Error listing objects from bucket '{bucket_name}' with prefix '{prefix}': {e}")
-            raise NetworkError(f"Failed to list objects: {e}")
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        """Context manager exit with resource cleanup"""
+        self.cleanup()
+        return False  # Don't suppress exceptions
     
-    @retry_with_exponential_backoff()
-    def _resilient_get_object(self, bucket_name: str, object_name: str):
-        """Get object with retry logic and timeout handling"""
-        try:
-            response = self.minio_client.get_object(bucket_name, object_name)
-            return response
-        except Exception as e:
-            print(f"⚠️  Error downloading object '{object_name}' from bucket '{bucket_name}': {e}")
-            raise NetworkError(f"Failed to download object: {e}")
+    def cleanup(self):
+        """Cleanup all resources"""
+        # Cleanup file manager resources
+        self.file_manager.cleanup()
+        
+        # Cleanup git credential helper
+        self._cleanup_git_credential_helper()
+        
+        print("🧹 Resource cleanup completed")
     
     def _safe_write_file(self, file_path: Path, content: str, description: str = "file"):
         """Safely write content to file with comprehensive error handling"""
@@ -527,7 +892,7 @@ class MinioGitOpsGenerator:
             file_path.parent.mkdir(parents=True, exist_ok=True)
             
             # Check available disk space (basic check)
-            import shutil
+    
             free_space = shutil.disk_usage(file_path.parent).free
             content_size = len(content.encode('utf-8'))
             
@@ -673,7 +1038,7 @@ class MinioGitOpsGenerator:
             raise ValidationError(f"{resource_type} name too long ({len(name)} > {Constants.MAX_KUBERNETES_NAME_LENGTH}): {name}")
         
         # Basic Kubernetes naming validation
-        import re
+
         if not re.match(r'^[a-z0-9]([-a-z0-9]*[a-z0-9])?$', name):
             raise ValidationError(f"Invalid {resource_type} name format: {name}. Must be lowercase alphanumeric with hyphens.")
     
@@ -689,7 +1054,7 @@ class MinioGitOpsGenerator:
     @timeout_handler(timeout_seconds=Constants.MAX_MINIO_TIMEOUT)
     def scan_minio_bucket(self) -> Tuple[List[NamespaceConfig], ProcessingResult]:
         """Scan Minio bucket and detect namespaces with their resources"""
-        print(f"🔍 Scanning Minio bucket: {self.bucket_name}/{self.bucket_prefix}")
+        print(f"🔍 Scanning Minio bucket: {self.minio_handler.bucket_name}/{self.minio_handler.bucket_prefix}")
         
         namespace_resources = {}
         result = ProcessingResult()
@@ -698,15 +1063,13 @@ class MinioGitOpsGenerator:
             # Memory-optimized batch processing approach
             print("📋 Processing objects in memory-efficient batches...")
             
-            batch_size = Constants.MEMORY_BATCH_SIZE if hasattr(Constants, 'MEMORY_BATCH_SIZE') else 100
+            batch_size = Constants.MEMORY_BATCH_SIZE
             batch = []
             processed_count = 0
             total_objects = 0  # We'll count as we go
             
             # Process objects in batches to control memory usage with resilient connection
-            for obj in self._resilient_list_objects(
-                self.bucket_name, 
-                prefix=self.bucket_prefix,
+            for obj in self.minio_handler.list_objects(
                 recursive=True
             ):
                 total_objects += 1
@@ -716,6 +1079,11 @@ class MinioGitOpsGenerator:
                 if len(batch) >= batch_size:
                     processed_count += self._process_object_batch(batch, namespace_resources, result, processed_count, total_objects)
                     batch.clear()  # Clear batch to free memory
+                    
+                    # Force garbage collection for large batches
+                    if processed_count % (batch_size * 10) == 0:
+                        import gc
+                        gc.collect()
             
             # Process final batch
             if batch:
@@ -753,7 +1121,7 @@ class MinioGitOpsGenerator:
         
         # Validate namespace and file limits
         try:
-            self._validate_namespace_limits(namespace_resources)
+            ValidationManager.validate_namespace_limits(namespace_resources)
         except ValidationError as e:
             result.add_failure("validation", str(e))
             print(f"❌ Validation Error: {e}")
@@ -906,7 +1274,7 @@ class MinioGitOpsGenerator:
         """Platform-agnostic path parsing for Minio object paths"""
         try:
             # Import platform-specific utilities
-            import os
+    
             from pathlib import PurePosixPath  # Minio always uses POSIX paths
             
             # Remove prefix and clean path - always use forward slashes for Minio
@@ -950,7 +1318,7 @@ class MinioGitOpsGenerator:
     
     def _is_valid_namespace_name(self, name: str) -> bool:
         """Validate Kubernetes namespace naming rules"""
-        import re
+
         
         # Basic Kubernetes naming rules
         if len(name) > Constants.MAX_NAMESPACE_LENGTH:
@@ -1079,13 +1447,13 @@ class MinioGitOpsGenerator:
                     continue
                 
                 for filename in filenames:
-                    minio_path = f"{self.bucket_prefix}/{namespace.name}/{filename}".strip('/')
+                    minio_path = f"{self.minio_handler.bucket_prefix}/{namespace.name}/{filename}".strip('/')
                     local_path = resource_dir / filename
                     
                     try:
                         # Download file from Minio
-                        self.minio_client.fget_object(
-                            self.bucket_name,
+                        self.minio_handler.minio_client.fget_object(
+                            self.minio_handler.bucket_name,
                             minio_path,
                             str(local_path)
                         )
@@ -1199,7 +1567,7 @@ class MinioGitOpsGenerator:
             
             # Use safe file writing
             cleaned_content = yaml.dump_all(cleaned_docs, default_flow_style=False, sort_keys=False)
-            self._safe_write_file(file_path, cleaned_content, "cleaned YAML file")
+            self.file_manager.safe_write_file(file_path, cleaned_content, "cleaned YAML file")
             
             return True
                 
@@ -1300,8 +1668,8 @@ class MinioGitOpsGenerator:
             }
             
             app_file = apps_path / f"{env}.yaml"
-            with open(app_file, 'w') as f:
-                yaml.dump(app_manifest, f, default_flow_style=False, sort_keys=False)
+            content = yaml.dump(app_manifest, default_flow_style=False, sort_keys=False)
+            self.file_manager.safe_write_file(app_file, content, f"ArgoCD App for {env}")
             
             print(f"📄 Generated ArgoCD App: {app_file}")
     
@@ -1346,7 +1714,7 @@ class MinioGitOpsGenerator:
         for pvc_name, base_size in detected_pvcs:
             # Parse base size to create scaled versions
             try:
-                import re
+        
                 size_match = re.match(r'(\d+)(\w+)', base_size)
                 if size_match:
                     base_num = int(size_match.group(1))
@@ -1361,7 +1729,8 @@ class MinioGitOpsGenerator:
                     storage_configs['test'][pvc_name] = Constants.DEFAULT_STORAGE_TEST
                     storage_configs['preprod'][pvc_name] = Constants.DEFAULT_STORAGE_PREPROD
                     storage_configs['prod'][pvc_name] = Constants.DEFAULT_STORAGE_PROD
-            except Exception:
+            except (yaml.YAMLError, KeyError, AttributeError, TypeError) as e:
+                print(f"⚠️  Warning: Could not parse PVC file {pvc_file.name}: {e}")
                 # Fallback to default sizes using constants
                 storage_configs['test'][pvc_name] = Constants.DEFAULT_STORAGE_TEST
                 storage_configs['preprod'][pvc_name] = Constants.DEFAULT_STORAGE_PREPROD
@@ -1427,7 +1796,7 @@ class MinioGitOpsGenerator:
         
         # Use safe file writing
         content = yaml.dump(base_kustomization, default_flow_style=False, sort_keys=False)
-        self._safe_write_file(base_file, content, "base Kustomization")
+        self.file_manager.safe_write_file(base_file, content, "base Kustomization")
     
     def _generate_environment_overlays(self, namespace: NamespaceConfig) -> None:
         """Generate environment overlay kustomizations"""
@@ -1486,7 +1855,7 @@ class MinioGitOpsGenerator:
         
         # Use safe file writing
         content = yaml.dump(overlay_kustomization, default_flow_style=False, sort_keys=False)
-        self._safe_write_file(overlay_file, content, f"{env} environment Kustomization")
+        self.file_manager.safe_write_file(overlay_file, content, f"{env} environment Kustomization")
     
     def _create_environment_patches(self, namespace: NamespaceConfig, env: str, config: dict) -> list:
         """Create patches for environment-specific configurations"""
@@ -1588,7 +1957,7 @@ kubectl get all,pvc,routes,configmaps -n {namespace.name}
         readme_file = Path(Constants.BASE_NAMESPACE_DIR) / namespace.name / "README.md"
         
         # Use safe file writing
-        self._safe_write_file(readme_file, readme_content, "namespace README")
+        self.file_manager.safe_write_file(readme_file, readme_content, "namespace README")
     
     def _generate_root_readme(self) -> None:
         """Generate root README with overview of all namespaces"""
@@ -1649,18 +2018,26 @@ argocd cluster add prod-context --name prod-cluster
         
         # Use safe file writing for root README
         root_readme_path = Path('README.md')
-        self._safe_write_file(root_readme_path, readme_content, "root README")
+        self.file_manager.safe_write_file(root_readme_path, readme_content, "root README")
     
     def setup_git_repository(self, git_config: dict):
-        """Setup git repository with authentication"""
+        """Setup git repository with secure authentication"""
         auth_manager = GitAuthManager(git_config)
-        authenticated_url = auth_manager.setup_authentication()
+        clean_url = auth_manager.setup_authentication()
         
         print(f"🔧 Setting up Git repository with {git_config.get('auth_method', 'ssh')} authentication...")
         
         try:
+    
+    
+            
+            # Setup git credential helper for secure authentication
+            auth_method = git_config.get('auth_method', 'ssh')
+            if auth_method in ['pat', 'basic']:
+                # Create askpass script for secure credential handling
+                self._setup_git_credential_helper()
+            
             # Check if git repo is already initialized
-            import subprocess
             result = subprocess.run(['git', 'status'], capture_output=True, text=True)
             
             if result.returncode != 0:
@@ -1670,21 +2047,84 @@ argocd cluster add prod-context --name prod-cluster
             
             # Add/update remote origin
             try:
-                subprocess.run(['git', 'remote', 'remove', 'origin'], check=False)
-            except:
+                subprocess.run(['git', 'remote', 'remove', 'origin'], capture_output=True)
+            except subprocess.CalledProcessError:
                 pass  # Remote might not exist
             
-            subprocess.run(['git', 'remote', 'add', 'origin', authenticated_url], check=True)
+            subprocess.run(['git', 'remote', 'add', 'origin', clean_url], check=True)
             print(f"🔗 Added remote origin: {git_config['repository']}")
             
-            return authenticated_url
+            return clean_url
             
         except subprocess.CalledProcessError as e:
             raise ConfigurationError(f"Failed to setup git repository: {e}")
     
+    def _setup_git_credential_helper(self):
+        """Setup git credential helper for secure authentication"""
+
+
+
+
+        
+        # Platform-specific askpass script
+        if os.name == 'nt':  # Windows
+            askpass_content = '''@echo off
+if "%~1" == "" goto :EOF
+echo %~1 | findstr /i "Username" >nul
+if not errorlevel 1 (
+    echo %GIT_USERNAME%
+    goto :EOF
+)
+echo %~1 | findstr /i "Password" >nul
+if not errorlevel 1 (
+    echo %GIT_PASSWORD%
+    goto :EOF
+)
+'''
+            suffix = '.bat'
+        else:  # Unix/Linux/macOS
+            askpass_content = '''#!/bin/bash
+if [[ "$1" == *"Username"* ]]; then
+    echo "$GIT_USERNAME"
+elif [[ "$1" == *"Password"* ]] || [[ "$1" == *"password"* ]]; then
+    echo "$GIT_PASSWORD"
+fi
+'''
+            suffix = '.sh'
+        
+        # Create temporary askpass script
+        with tempfile.NamedTemporaryFile(mode='w', suffix=suffix, delete=False) as f:
+            f.write(askpass_content)
+            askpass_path = f.name
+        
+        # Make script executable (Unix only)
+        if os.name != 'nt':
+            os.chmod(askpass_path, stat.S_IRWXU)
+        
+        # Set GIT_ASKPASS environment variable
+        os.environ['GIT_ASKPASS'] = askpass_path
+        
+        # Store askpass path for cleanup
+        self._askpass_script_path = askpass_path
+        self._temp_files.append(askpass_path)  # Track for cleanup
+        
+        print("🔐 Configured secure git credential helper")
+    
+    def _cleanup_git_credential_helper(self):
+        """Cleanup temporary askpass script"""
+        if hasattr(self, '_askpass_script_path'):
+    
+            try:
+                os.unlink(self._askpass_script_path)
+                print("🧹 Cleaned up temporary credential helper")
+            except FileNotFoundError:
+                pass  # Already cleaned up
+            except Exception as e:
+                print(f"⚠️  Warning: Could not cleanup askpass script: {e}")
+    
     def commit_and_push_changes(self, git_config: dict):
         """Commit and push changes to git repository"""
-        import subprocess
+
         
         try:
             # Add all files
@@ -1728,6 +2168,9 @@ Co-Authored-By: Claude <noreply@anthropic.com>"""
             if hasattr(e, 'stderr') and e.stderr:
                 error_msg += f"\nError output: {e.stderr}"
             raise ConfigurationError(error_msg)
+        finally:
+            # Always cleanup credential helper
+            self._cleanup_git_credential_helper()
 
 def load_config(config_path='config.yaml', validate_env=True):
     """Simplified configuration loading with environment variable support"""
@@ -1886,69 +2329,72 @@ def main():
         print("💡 Make sure config.yaml exists and is properly formatted")
         sys.exit(1)
     
-    # Initialize generator
-    generator = MinioGitOpsGenerator(minio_config, cluster_mappings, git_repo)
-    
-    overall_result = ProcessingResult()
-    
-    try:
-        print("🚀 Starting Minio to GitOps generation...")
+    # Initialize generator with context manager for automatic resource cleanup
+    with MinioGitOpsGenerator(minio_config, cluster_mappings, git_repo) as generator:
+        overall_result = ProcessingResult()
         
-        # Step 1: Scan Minio bucket to detect namespaces and resources
-        print("\n📋 Step 1: Scanning Minio bucket...")
-        namespaces, scan_result = generator.scan_minio_bucket()
-        overall_result.success_files.extend(scan_result.success_files)
-        overall_result.failed_files.extend(scan_result.failed_files)
-        overall_result.warnings.extend(scan_result.warnings)
-        
-        # Check if we found any namespaces
-        if not namespaces:
-            print("❌ No namespaces found in Minio bucket!")
-            if scan_result.has_failures():
-                print("💡 This might be due to connection issues or path structure problems")
-                scan_result.print_summary()
-            sys.exit(1)
-        
-        generator.namespaces = namespaces
-        
-        # Step 2: Download all resources from Minio (with error handling)
-        print("\n📥 Step 2: Downloading resources...")
-        download_result = generator.download_resources()
-        if download_result:
-            overall_result.failed_files.extend(download_result.failed_files)
-            overall_result.warnings.extend(download_result.warnings)
-        
-        # Step 3: Generate complete GitOps structure
-        print("\n🏗️  Step 3: Generating GitOps structure...")
-        generator.generate_gitops_structure()
-        
-        # Print results
-        print("🎉 GitOps structure generation completed!")
-        print(f"📁 Generated {len(generator.namespaces)} namespaces:")
-        for ns in generator.namespaces:
-            resource_count = sum(len(files) for files in ns.resources.values())
-            print(f"   • {ns.name}: {resource_count} resources")
-        
-        # Show processing summary
-        overall_result.print_summary()
-        
-        # Setup git repository and push changes
         try:
-            print("\n🔧 Setting up Git repository...")
-            generator.setup_git_repository(git_config)
+            print("🚀 Starting Minio to GitOps generation...")
             
-            print("📤 Committing and pushing changes...")
-            generator.commit_and_push_changes(git_config)
+            # Step 1: Scan Minio bucket to detect namespaces and resources
+            print("\n📋 Step 1: Scanning Minio bucket...")
+            namespaces, scan_result = generator.scan_minio_bucket()
+            overall_result.success_files.extend(scan_result.success_files)
+            overall_result.failed_files.extend(scan_result.failed_files)
+            overall_result.warnings.extend(scan_result.warnings)
+        
+            # Check if we found any namespaces
+            if not namespaces:
+                print("❌ No namespaces found in Minio bucket!")
+                if scan_result.has_failures():
+                    print("💡 This might be due to connection issues or path structure problems")
+                    scan_result.print_summary()
+                sys.exit(1)
+        
+            generator.namespaces = namespaces
+        
+            # Step 2: Download all resources from Minio (with error handling)
+            print("\n📥 Step 2: Downloading resources...")
+            download_result = generator.download_resources()
+            if download_result:
+                overall_result.failed_files.extend(download_result.failed_files)
+                overall_result.warnings.extend(download_result.warnings)
+        
+            # Step 3: Generate complete GitOps structure
+            print("\n🏗️  Step 3: Generating GitOps structure...")
+            generator.generate_gitops_structure()
+        
+            # Print results
+            print("🎉 GitOps structure generation completed!")
+            print(f"📁 Generated {len(generator.namespaces)} namespaces:")
+            for ns in generator.namespaces:
+                resource_count = sum(len(files) for files in ns.resources.values())
+                print(f"   • {ns.name}: {resource_count} resources")
+        
+            # Show processing summary
+            overall_result.print_summary()
+        
+            # Setup git repository and push changes
+            try:
+                print("\n🔧 Setting up Git repository...")
+                generator.setup_git_repository(git_config)
             
-            print("\n🎉 Successfully pushed GitOps structure to repository!")
+                print("📤 Committing and pushing changes...")
+                generator.commit_and_push_changes(git_config)
             
-        except Exception as git_error:
-            print(f"\n⚠️  Git operation failed: {git_error}")
-            print("\n📝 Manual git steps (if needed):")
-            print("1. Review generated files")
-            print("2. git add .")
-            print("3. git commit -m 'Auto-generated GitOps structure'")
-            print("4. git push origin main")
+                print("\n🎉 Successfully pushed GitOps structure to repository!")
+            
+            except Exception as git_error:
+                print(f"\n⚠️  Git operation failed: {git_error}")
+                print("\n📝 Manual git steps (if needed):")
+                print("1. Review generated files")
+                print("2. git add .")
+                print("3. git commit -m 'Auto-generated GitOps structure'")
+                print("4. git push origin main")
+        
+        except Exception as e:
+            print(f"\n❌ Critical error: {e}")
+            overall_result.add_failure("critical_error", str(e))
         
         # Show next steps
         print("\n📋 Next steps:")
@@ -1966,8 +2412,7 @@ def main():
             sys.exit(2)  # Warning exit code
         else:
             print("\n✅ All files processed successfully!")
-            sys.exit(0)
-        
+            
     except KeyboardInterrupt:
         print("\n⏹️  Operation cancelled by user")
         sys.exit(130)  # Standard SIGINT exit code
