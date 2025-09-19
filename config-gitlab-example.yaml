@@ -1,0 +1,70 @@
+# GitLab PAT Token Example Configuration
+# Copy this to config.yaml and update with your values
+
+minio:
+  endpoint: "localhost:9000"
+  access_key: "minioadmin"
+  secret_key: "minioadmin123"
+  secure: false
+  bucket: "openshift-cluster-backups-4"
+  prefix: "crc.testing/crc-wrl62"
+
+git:
+  # GitLab repository URL (gitlab.com or self-hosted)
+  repository: "https://gitlab.com/your-username/your-repository.git"
+  # For self-hosted: "https://gitlab.yourcompany.com/your-group/your-project.git"
+  
+  # Use Personal Access Token (PAT) authentication
+  auth_method: "pat"
+  
+  # PAT configuration for GitLab
+  pat:
+    token: "glpat-your-gitlab-pat-token-here"     # Replace with your actual PAT
+    username: "oauth2"                            # GitLab uses "oauth2" as username for PAT
+
+# Alternative: Use environment variables for security
+# Set these environment variables instead of hardcoding in config:
+# export GIT_PAT_TOKEN="glpat-your-gitlab-pat-token"
+# export GIT_PAT_USERNAME="oauth2"
+
+# Cluster mappings for different environments
+clusters:
+  default:
+    dev: "https://dev-cluster-api.example.com"
+    test: "https://test-cluster-api.example.com" 
+    preprod: "https://preprod-cluster-api.example.com"
+    prod: "https://prod-cluster-api.example.com"
+
+# Environment-specific settings
+environments:
+  dev:
+    sync_policy: "automated"
+    replicas: 1
+    storage_size_small: "2Gi"
+    storage_size_large: "5Gi"
+    
+  test:
+    sync_policy: "automated"
+    replicas: 1  
+    storage_size_small: "1Gi"
+    storage_size_large: "2Gi"
+    
+  preprod:
+    sync_policy: "manual"
+    replicas: 2
+    storage_size_small: "10Gi"
+    storage_size_large: "20Gi"
+    
+  prod:
+    sync_policy: "manual"
+    replicas: 3
+    storage_size_small: "50Gi" 
+    storage_size_large: "100Gi"
+
+# How to create PAT token in GitLab:
+# 1. Go to GitLab → User Settings → Access Tokens
+# 2. Set token name: "Minio-to-GitOps"
+# 3. Select expiration date
+# 4. Scopes: Select "write_repository" for push access
+# 5. Click "Create personal access token" and copy the token
+# 6. Use the token in this config or set GIT_PAT_TOKEN environment variable

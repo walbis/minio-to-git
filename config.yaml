@@ -11,6 +11,49 @@ minio:
 
 git:
   repository: "https://github.com/walbis/test.git"  # Target Git repository
+  
+  # Authentication methods (choose one)
+  auth_method: "ssh"  # Options: "ssh", "pat", "basic", "none"
+  
+  # SSH Configuration (for auth_method: "ssh")
+  ssh:
+    private_key_path: "~/.ssh/id_rsa"  # Path to SSH private key
+    passphrase: ""                     # SSH key passphrase (if any)
+  
+  # Personal Access Token (for auth_method: "pat")
+  # Supports GitHub, GitLab, Azure DevOps, Bitbucket
+  pat:
+    token: ""                          # PAT token (or use GIT_PAT_TOKEN env var)
+    username: ""                       # Username for PAT (optional for some platforms)
+  
+  # Basic Authentication (for auth_method: "basic")
+  basic:
+    username: ""                       # Git username (or use GIT_USERNAME env var)
+    password: ""                       # Git password (or use GIT_PASSWORD env var)
+  
+  # Platform-specific examples:
+  # GitHub with PAT:
+  #   repository: "https://github.com/username/repo.git"
+  #   auth_method: "pat"
+  #   pat.token: "ghp_xxxxxxxxxxxxxxxxxxxx"
+  #
+  # Azure DevOps with PAT:
+  #   repository: "https://dev.azure.com/organization/project/_git/repository"
+  #   auth_method: "pat" 
+  #   pat.username: "any_string"  # Azure DevOps requires any username
+  #   pat.token: "xxxxxxxxxxxxxxxxxxxx"
+  #
+  # GitLab with PAT:
+  #   repository: "https://gitlab.com/username/repo.git"
+  #   auth_method: "pat"
+  #   pat.username: "oauth2"  # GitLab uses "oauth2" as username
+  #   pat.token: "glpat-xxxxxxxxxxxxxxxxxxxx"
+  #
+  # Bitbucket with App Password:
+  #   repository: "https://bitbucket.org/username/repo.git"
+  #   auth_method: "basic"
+  #   basic.username: "your_username"
+  #   basic.password: "app_password_token"
 
 # Cluster mappings for different environments
 clusters:

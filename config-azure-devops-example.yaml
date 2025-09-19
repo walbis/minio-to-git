@@ -1,0 +1,70 @@
+# Azure DevOps PAT Token Example Configuration
+# Copy this to config.yaml and update with your values
+
+minio:
+  endpoint: "localhost:9000"
+  access_key: "minioadmin"
+  secret_key: "minioadmin123"
+  secure: false
+  bucket: "openshift-cluster-backups-4"
+  prefix: "crc.testing/crc-wrl62"
+
+git:
+  # Azure DevOps repository URL
+  repository: "https://dev.azure.com/your-organization/your-project/_git/your-repository"
+  
+  # Use Personal Access Token (PAT) authentication
+  auth_method: "pat"
+  
+  # PAT configuration for Azure DevOps
+  pat:
+    token: "your-azure-devops-pat-token-here"     # Replace with your actual PAT
+    username: "any"                               # Azure DevOps accepts any username with PAT
+
+# Alternative: Use environment variables for security
+# Set these environment variables instead of hardcoding in config:
+# export GIT_PAT_TOKEN="your-azure-devops-pat-token"
+# export GIT_PAT_USERNAME="any"
+
+# Cluster mappings for different environments
+clusters:
+  default:
+    dev: "https://dev-cluster-api.example.com"
+    test: "https://test-cluster-api.example.com" 
+    preprod: "https://preprod-cluster-api.example.com"
+    prod: "https://prod-cluster-api.example.com"
+
+# Environment-specific settings
+environments:
+  dev:
+    sync_policy: "automated"
+    replicas: 1
+    storage_size_small: "2Gi"
+    storage_size_large: "5Gi"
+    
+  test:
+    sync_policy: "automated"
+    replicas: 1  
+    storage_size_small: "1Gi"
+    storage_size_large: "2Gi"
+    
+  preprod:
+    sync_policy: "manual"
+    replicas: 2
+    storage_size_small: "10Gi"
+    storage_size_large: "20Gi"
+    
+  prod:
+    sync_policy: "manual"
+    replicas: 3
+    storage_size_small: "50Gi" 
+    storage_size_large: "100Gi"
+
+# How to create PAT token in Azure DevOps:
+# 1. Go to Azure DevOps → User Settings → Personal Access Tokens
+# 2. Click "New Token"
+# 3. Set name: "Minio-to-GitOps"
+# 4. Select organization and expiration
+# 5. Scopes: Select "Code (full)" for read/write access
+# 6. Click "Create" and copy the token
+# 7. Use the token in this config or set GIT_PAT_TOKEN environment variable

@@ -93,6 +93,85 @@ export GIT_REPOSITORY="https://github.com/your-org/gitops-repo.git"
 python3 minio-to-gitops.py
 ```
 
+## 🔐 Git Authentication Support
+
+### Supported Authentication Methods:
+
+| Method | Description | Platforms | Use Case |
+|--------|-------------|-----------|----------|
+| **SSH** | SSH key authentication | GitHub, GitLab, Azure DevOps, Bitbucket | Most secure, recommended for production |
+| **PAT** | Personal Access Token | GitHub, GitLab, Azure DevOps | CI/CD pipelines, automated workflows |
+| **Basic** | Username/Password | All platforms | Simple setups, app passwords |
+| **None** | No authentication | Public repositories | Open source projects |
+
+### Platform-Specific Configuration:
+
+#### 🔷 Azure DevOps with PAT:
+```yaml
+git:
+  repository: "https://dev.azure.com/organization/project/_git/repository"
+  auth_method: "pat"
+  pat:
+    username: "any"  # Azure DevOps accepts any username
+    token: "your-pat-token"  # Or use GIT_PAT_TOKEN env var
+```
+
+#### 🔷 GitHub with PAT:
+```yaml
+git:
+  repository: "https://github.com/username/repo.git"
+  auth_method: "pat"
+  pat:
+    token: "ghp_xxxxxxxxxxxxxxxxxxxx"  # Or use GIT_PAT_TOKEN env var
+```
+
+#### 🔷 GitLab with PAT:
+```yaml
+git:
+  repository: "https://gitlab.com/username/repo.git"
+  auth_method: "pat"
+  pat:
+    username: "oauth2"  # GitLab requires "oauth2" as username
+    token: "glpat-xxxxxxxxxxxxxxxxxxxx"  # Or use GIT_PAT_TOKEN env var
+```
+
+#### 🔷 SSH Authentication (All Platforms):
+```yaml
+git:
+  repository: "git@github.com:username/repo.git"  # Will auto-convert HTTPS to SSH
+  auth_method: "ssh"
+  ssh:
+    private_key_path: "~/.ssh/id_rsa"
+    passphrase: ""  # Optional
+```
+
+### 🔒 Secure Credential Management:
+
+Use environment variables for sensitive data:
+
+```bash
+# Azure DevOps
+export GIT_PAT_TOKEN="your-azure-devops-token"
+export GIT_PAT_USERNAME="any"
+
+# GitHub
+export GIT_PAT_TOKEN="ghp_your-github-token"
+
+# GitLab
+export GIT_PAT_TOKEN="glpat-your-gitlab-token"
+export GIT_PAT_USERNAME="oauth2"
+
+# Basic Auth
+export GIT_USERNAME="your-username"
+export GIT_PASSWORD="your-password"
+```
+
+### 📋 Example Configurations:
+
+- **Azure DevOps**: `config-azure-devops-example.yaml`
+- **GitHub**: `config-github-example.yaml`
+- **GitLab**: `config-gitlab-example.yaml`
+
 ## 📦 Generated Structure
 
 ### Per Namespace:
@@ -207,6 +286,7 @@ spec:
 - ✅ **YAML Structure Limits**: Max depth (20), max items (1000), max string length (10K)
 - ✅ **Kubernetes Validation**: RFC-compliant resource naming, namespace limits
 - ✅ **File Encoding**: UTF-8 validation, encoding error handling
+- ✅ **Git Authentication**: PAT tokens, SSH keys, basic auth with secure credential handling
 
 ### 🌐 Network Resilience (v3.0):
 - ✅ **Exponential Backoff**: Configurable retry with jitter (3 attempts default)

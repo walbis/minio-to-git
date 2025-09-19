@@ -197,6 +197,153 @@ def retry_with_exponential_backoff(max_attempts=None, initial_delay=None, max_de
         return wrapper
     return decorator
 
+class GitAuthManager:
+    """Manages Git authentication for different platforms and methods"""
+    
+    def __init__(self, git_config: dict):
+        self.git_config = git_config
+        self.auth_method = git_config.get('auth_method', 'ssh')
+        self.repository = git_config['repository']
+        
+    def setup_authentication(self):
+        """Setup git authentication based on configured method"""
+        if self.auth_method == 'pat':
+            return self._setup_pat_auth()
+        elif self.auth_method == 'basic':
+            return self._setup_basic_auth()
+        elif self.auth_method == 'ssh':
+            return self._setup_ssh_auth()
+        elif self.auth_method == 'none':
+            return self._setup_no_auth()
+        else:
+            raise ConfigurationError(f"Unsupported auth method: {self.auth_method}")
+    
+    def _setup_pat_auth(self):
+        """Setup Personal Access Token authentication"""
+        pat_config = self.git_config.get('pat', {})
+        token = pat_config.get('token', '')
+        username = pat_config.get('username', '')
+        
+        if not token:
+            raise ConfigurationError("PAT token is required but not provided")
+        
+        # Determine platform and setup appropriate auth
+        if 'dev.azure.com' in self.repository:
+            return self._setup_azure_devops_pat(token, username)
+        elif 'github.com' in self.repository:
+            return self._setup_github_pat(token)
+        elif 'gitlab.com' in self.repository or 'gitlab' in self.repository:
+            return self._setup_gitlab_pat(token)
+        elif 'bitbucket.org' in self.repository:
+            return self._setup_bitbucket_pat(token, username)
+        else:
+            # Generic HTTPS with token
+            return self._setup_generic_pat(token, username)
+    
+    def _setup_azure_devops_pat(self, token, username='any'):
+        """Setup Azure DevOps PAT authentication"""
+        if not username:
+            username = 'any'  # Azure DevOps accepts any username with PAT
+        
+        # Configure git credentials for Azure DevOps
+        import subprocess
+        try:
+            # Set credential helper for Azure DevOps
+            subprocess.run(['git', 'config', '--global', 'credential.https://dev.azure.com.helper', 'store'], check=True)
+            
+            # Create authenticated URL
+            auth_url = self.repository.replace('https://', f'https://{username}:{token}@')
+            return auth_url
+            
+        except subprocess.CalledProcessError as e:
+            raise ConfigurationError(f"Failed to configure Azure DevOps authentication: {e}")
+    
+    def _setup_github_pat(self, token):
+        """Setup GitHub PAT authentication"""
+        # GitHub doesn't require username for PAT, just token
+        auth_url = self.repository.replace('https://', f'https://{token}@')
+        return auth_url
+    
+    def _setup_gitlab_pat(self, token):
+        """Setup GitLab PAT authentication"""
+        # GitLab uses 'oauth2' as username for PAT
+        auth_url = self.repository.replace('https://', f'https://oauth2:{token}@')
+        return auth_url
+    
+    def _setup_bitbucket_pat(self, token, username):
+        """Setup Bitbucket App Password authentication"""
+        if not username:
+            raise ConfigurationError("Bitbucket requires username for App Password authentication")
+        
+        auth_url = self.repository.replace('https://', f'https://{username}:{token}@')
+        return auth_url
+    
+    def _setup_generic_pat(self, token, username='token'):
+        """Setup generic PAT authentication"""
+        if not username:
+            username = 'token'
+        
+        auth_url = self.repository.replace('https://', f'https://{username}:{token}@')
+        return auth_url
+    
+    def _setup_basic_auth(self):
+        """Setup basic username/password authentication"""
+        basic_config = self.git_config.get('basic', {})
+        username = basic_config.get('username', '')
+        password = basic_config.get('password', '')
+        
+        if not username or not password:
+            raise ConfigurationError("Username and password are required for basic authentication")
+        
+        auth_url = self.repository.replace('https://', f'https://{username}:{password}@')
+        return auth_url
+    
+    def _setup_ssh_auth(self):
+        """Setup SSH key authentication"""
+        ssh_config = self.git_config.get('ssh', {})
+        private_key_path = ssh_config.get('private_key_path', '~/.ssh/id_rsa')
+        passphrase = ssh_config.get('passphrase', '')
+        
+        # Convert HTTPS URL to SSH if needed
+        if self.repository.startswith('https://'):
+            ssh_url = self._convert_https_to_ssh(self.repository)
+            print(f"🔑 Converted to SSH URL: {ssh_url}")
+            return ssh_url
+        
+        return self.repository
+    
+    def _convert_https_to_ssh(self, https_url):
+        """Convert HTTPS URL to SSH format"""
+        import re
+        
+        # GitHub pattern
+        if 'github.com' in https_url:
+            match = re.match(r'https://github\.com/([^/]+)/([^/]+)\.git', https_url)
+            if match:
+                user, repo = match.groups()
+                return f'git@github.com:{user}/{repo}.git'
+        
+        # GitLab pattern
+        elif 'gitlab.com' in https_url:
+            match = re.match(r'https://gitlab\.com/([^/]+)/([^/]+)\.git', https_url)
+            if match:
+                user, repo = match.groups()
+                return f'git@gitlab.com:{user}/{repo}.git'
+        
+        # Azure DevOps pattern (more complex)
+        elif 'dev.azure.com' in https_url:
+            match = re.match(r'https://dev\.azure\.com/([^/]+)/([^/]+)/_git/([^/]+)', https_url)
+            if match:
+                org, project, repo = match.groups()
+                return f'git@ssh.dev.azure.com:v3/{org}/{project}/{repo}'
+        
+        # Generic pattern - keep as is
+        return https_url
+    
+    def _setup_no_auth(self):
+        """No authentication required"""
+        return self.repository
+
 def timeout_handler(timeout_seconds=None):
     """Decorator to add timeout handling to functions"""
     if timeout_seconds is None:
@@ -1503,6 +1650,84 @@ argocd cluster add prod-context --name prod-cluster
         # Use safe file writing for root README
         root_readme_path = Path('README.md')
         self._safe_write_file(root_readme_path, readme_content, "root README")
+    
+    def setup_git_repository(self, git_config: dict):
+        """Setup git repository with authentication"""
+        auth_manager = GitAuthManager(git_config)
+        authenticated_url = auth_manager.setup_authentication()
+        
+        print(f"🔧 Setting up Git repository with {git_config.get('auth_method', 'ssh')} authentication...")
+        
+        try:
+            # Check if git repo is already initialized
+            import subprocess
+            result = subprocess.run(['git', 'status'], capture_output=True, text=True)
+            
+            if result.returncode != 0:
+                # Initialize git repository
+                subprocess.run(['git', 'init'], check=True)
+                print("📁 Initialized new Git repository")
+            
+            # Add/update remote origin
+            try:
+                subprocess.run(['git', 'remote', 'remove', 'origin'], check=False)
+            except:
+                pass  # Remote might not exist
+            
+            subprocess.run(['git', 'remote', 'add', 'origin', authenticated_url], check=True)
+            print(f"🔗 Added remote origin: {git_config['repository']}")
+            
+            return authenticated_url
+            
+        except subprocess.CalledProcessError as e:
+            raise ConfigurationError(f"Failed to setup git repository: {e}")
+    
+    def commit_and_push_changes(self, git_config: dict):
+        """Commit and push changes to git repository"""
+        import subprocess
+        
+        try:
+            # Add all files
+            subprocess.run(['git', 'add', '.'], check=True)
+            print("📄 Added all files to git staging")
+            
+            # Check if there are changes to commit
+            result = subprocess.run(['git', 'diff', '--cached', '--quiet'], capture_output=True)
+            if result.returncode == 0:
+                print("ℹ️  No changes to commit")
+                return
+            
+            # Commit changes
+            commit_message = f"""Auto-generated GitOps structure from Minio bucket
+
+📦 Generated {len(self.namespaces)} namespace(s):
+{chr(10).join([f"   • {ns.name}: {sum(len(files) for files in ns.resources.values())} resources" for ns in self.namespaces])}
+
+🤖 Generated with [Claude Code](https://claude.ai/code)
+
+Co-Authored-By: Claude <noreply@anthropic.com>"""
+            
+            subprocess.run(['git', 'commit', '-m', commit_message], check=True)
+            print("✅ Committed changes to git")
+            
+            # Push changes
+            auth_method = git_config.get('auth_method', 'ssh')
+            print(f"🚀 Pushing to remote repository using {auth_method} authentication...")
+            
+            result = subprocess.run(['git', 'push', 'origin', 'main'], capture_output=True, text=True)
+            if result.returncode != 0:
+                # Try with master branch if main fails
+                result = subprocess.run(['git', 'push', 'origin', 'master'], capture_output=True, text=True)
+                if result.returncode != 0:
+                    raise subprocess.CalledProcessError(result.returncode, 'git push', result.stderr)
+            
+            print("🎉 Successfully pushed changes to remote repository!")
+            
+        except subprocess.CalledProcessError as e:
+            error_msg = f"Git operation failed: {e}"
+            if hasattr(e, 'stderr') and e.stderr:
+                error_msg += f"\nError output: {e.stderr}"
+            raise ConfigurationError(error_msg)
 
 def load_config(config_path='config.yaml', validate_env=True):
     """Simplified configuration loading with environment variable support"""
@@ -1530,23 +1755,46 @@ def load_config(config_path='config.yaml', validate_env=True):
     except yaml.YAMLError as e:
         raise ConfigurationError(f"Invalid YAML in config file: {e}")
     
-    # Simple environment variable override
+    # Environment variable mappings for configuration override
     env_mappings = {
+        # Minio configuration
         'MINIO_ENDPOINT': ('minio', 'endpoint'),
         'MINIO_ACCESS_KEY': ('minio', 'access_key'),
         'MINIO_SECRET_KEY': ('minio', 'secret_key'),
         'MINIO_BUCKET': ('minio', 'bucket'),
-        'GIT_REPOSITORY': ('git', 'repository')
+        
+        # Git configuration
+        'GIT_REPOSITORY': ('git', 'repository'),
+        'GIT_AUTH_METHOD': ('git', 'auth_method'),
+        
+        # Git PAT authentication
+        'GIT_PAT_TOKEN': ('git', 'pat', 'token'),
+        'GIT_PAT_USERNAME': ('git', 'pat', 'username'),
+        
+        # Git basic authentication
+        'GIT_USERNAME': ('git', 'basic', 'username'),
+        'GIT_PASSWORD': ('git', 'basic', 'password'),
+        
+        # Git SSH authentication
+        'GIT_SSH_PRIVATE_KEY': ('git', 'ssh', 'private_key_path'),
+        'GIT_SSH_PASSPHRASE': ('git', 'ssh', 'passphrase')
     }
     
-    # Apply environment overrides
+    # Apply environment overrides (supports nested configuration)
     env_used = []
-    for env_var, (section, key) in env_mappings.items():
+    for env_var, path_tuple in env_mappings.items():
         value = os.getenv(env_var)
         if value:
-            if section not in config:
-                config[section] = {}
-            config[section][key] = value
+            # Navigate to nested configuration
+            current = config
+            for i, key in enumerate(path_tuple[:-1]):
+                if key not in current:
+                    current[key] = {}
+                current = current[key]
+            
+            # Set the final value
+            final_key = path_tuple[-1]
+            current[final_key] = value
             env_used.append(env_var)
     
     if env_used:
@@ -1620,10 +1868,15 @@ def main():
         print("📋 Loading configuration...")
         minio_config, cluster_mappings, git_repo, full_config = load_config()
         
+        # Extract git configuration
+        git_config = full_config.get('git', {})
+        auth_method = git_config.get('auth_method', 'ssh')
+        
         print(f"✅ Configuration loaded successfully:")
         print(f"   • Minio: {minio_config['endpoint']}")
         print(f"   • Bucket: {minio_config['bucket']}")
         print(f"   • Git repo: {git_repo}")
+        print(f"   • Auth method: {auth_method}")
         
         # Create backup if namespaces directory exists
         backup_dir = create_backup()
@@ -1679,14 +1932,33 @@ def main():
         # Show processing summary
         overall_result.print_summary()
         
+        # Setup git repository and push changes
+        try:
+            print("\n🔧 Setting up Git repository...")
+            generator.setup_git_repository(git_config)
+            
+            print("📤 Committing and pushing changes...")
+            generator.commit_and_push_changes(git_config)
+            
+            print("\n🎉 Successfully pushed GitOps structure to repository!")
+            
+        except Exception as git_error:
+            print(f"\n⚠️  Git operation failed: {git_error}")
+            print("\n📝 Manual git steps (if needed):")
+            print("1. Review generated files")
+            print("2. git add .")
+            print("3. git commit -m 'Auto-generated GitOps structure'")
+            print("4. git push origin main")
+        
         # Show next steps
         print("\n📋 Next steps:")
         print("1. Review the generated namespaces/ directory")
         print("2. Update cluster endpoints in ArgoCD applications if needed")
-        print("3. Commit changes: git add . && git commit -m 'feat: auto-generated from Minio'")
-        print("4. Push to repository: git push origin main")
-        print("5. Register clusters in ArgoCD")
-        print("6. Deploy applications")
+        print("3. Register clusters in ArgoCD:")
+        for cluster_name in cluster_mappings.get('default', {}):
+            cluster_url = cluster_mappings['default'][cluster_name]
+            print(f"   argocd cluster add {cluster_name}-context --name {cluster_name}-cluster --server {cluster_url}")
+        print("4. Deploy applications via ArgoCD UI or CLI")
         
         # Exit with appropriate code
         if overall_result.has_failures():
